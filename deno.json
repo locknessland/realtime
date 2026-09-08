@@ -1,0 +1,26 @@
+{
+    "name": "@lockness/realtime",
+    "version": "0.3.0",
+    "license": "MIT",
+    "exports": {
+        ".": "./mod.ts",
+        "./client": "./client.ts"
+    },
+    "tasks": {
+        "test": "deno test -A tests/"
+    },
+    "publish": {
+        "exclude": [
+            "tests/"
+        ]
+    },
+    "imports": {
+        "@lockness/contract": "jsr:@lockness/contract@^0.3.0",
+        "@lockness/hono": "jsr:@lockness/hono@^0.3.0",
+        "@lockness/redis": "jsr:@lockness/redis@^0.3.0",
+        "@lockness/notification": "jsr:@lockness/notification@^0.3.0",
+        "@std/assert": "jsr:@std/assert@1",
+        "@std/testing": "jsr:@std/testing@^1.0.0"
+    },
+    "description": "Real-time WebSockets + broadcasting for Lockness — a handler over Hono upgradeWebSocket, public/private/presence channels with auth, and a memory/Redis broadcast driver"
+}
