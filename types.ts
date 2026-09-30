@@ -110,6 +110,20 @@ export interface RealtimeControlConfig {
  * from a wire frame) and is immutable; `metadata` is free-form and is never
  * treated as identity (security S1).
  *
+ * **One object per socket, for the socket's whole life** (#361). A transport
+ * that wires its own hooks must present the very object it passed to
+ * `ChannelManager.register` on every later call for that socket, and never
+ * build a fresh `Connection` per frame. The manager enforces it (#363): while
+ * the object it registered holds an id, `register` and `subscribe` refuse a
+ * different object under that id with `ConnectionIdInUseError`, before any
+ * authorizer runs; a retired object is refused with
+ * `ConnectionDisconnectedError`; and an object `register` never bound is
+ * refused by `subscribe` with `ConnectionNotRegisteredError` (#370).
+ * `buildEvents` creates one object per socket, so `handlerHooks` meets this for
+ * you. The other two lifecycle duties — register at open, disconnect at close
+ * with the registered object — are `ChannelManager.register`'s and
+ * `disconnect`'s to state.
+ *
  * @typeParam Identity - The app's identity shape (e.g. a user id or record).
  */
 export interface Connection<Identity = unknown> {
@@ -119,7 +133,11 @@ export interface Connection<Identity = unknown> {
      * **It must be unguessable and never reused.** The framework's own upgrade
      * path generates `crypto.randomUUID()`, but an application wiring its own
      * transport supplies this itself, and "stable" has been read as an
-     * invitation to pass a user id or a session id. It is not.
+     * invitation to pass a user id or a session id. It is not. **The server
+     * mints it, per socket** — never from client input, and never from a user
+     * or session key (#363). An id another socket can guess or share is one it
+     * can register first, which locks its owner out; and since a live id is
+     * refused, a refusal tells the caller that id is online.
      *
      * The reason is the control plane. `manager.evict(id)` travels between
      * instances as a signed frame naming this id, and an id that is guessable
@@ -141,7 +159,32 @@ export interface Connection<Identity = unknown> {
      * only for its type and is not covered here (#306).
      */
     readonly id: string
-    /** The server-verified identity, or `null` for an unauthenticated socket. */
+    /**
+     * The server-verified identity, or `null` for an unauthenticated socket.
+     *
+     * **This is the only charge target a rate meter can use** (#329), and the
+     * rule has one home — here. Two properties decide whether a key bounds
+     * anything, and clearing one is not enough:
+     *
+     * - **Rotation.** {@link Connection.id} is minted per socket and by
+     *   contract never reused, so a counter keyed on it is reset by every
+     *   reconnect. This value survives one.
+     * - **Minting.** It survives a reconnect; it is not unforgeable. Under open
+     *   self-registration an attacker mints identities at signup cost, so a
+     *   per-identity bucket scales with account count and needs a second key
+     *   above it.
+     *
+     * Two consequences for anyone metering on it. `null` here is **not** a
+     * fallback key: every unauthenticated socket shares it, so one bucket keyed
+     * on the null identity lets one attacker deny service to every other
+     * anonymous client. And `Identity` is `unknown`, so an object identity keys
+     * a `Map` **by reference** and a meter built on it misses every time and
+     * fails **open**, silently. Key on a stable string you derive.
+     *
+     * The framework itself meters no verb rate — see
+     * {@link ChannelManager.handlerHooks} for why, and `docs/realtime.md` for
+     * the per-frame costs and a worked example.
+     */
     readonly identity: Identity | null
     /** Free-form connection metadata; never an identity source. */
     readonly metadata: Readonly<Record<string, unknown>>

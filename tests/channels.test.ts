@@ -43,7 +43,9 @@ const sentOf = (c: Connection<User>) =>
 Deno.test('SC-003: a public channel delivers to all subscribers', async () => {
     const m = new ChannelManager<User>()
     const a = fakeConn('a', null)
+    m.register(a)
     const b = fakeConn('b', null)
+    m.register(b)
     await m.subscribe(a, 'news')
     await m.subscribe(b, 'news')
 
@@ -59,7 +61,9 @@ Deno.test('SC-003: a private channel rejects an unauthorized subscribe and deliv
         authorize: (id) => id?.id === 1, // only user 1 may join
     })
     const allowed = fakeConn('allowed', { id: 1 })
+    m.register(allowed)
     const denied = fakeConn('denied', { id: 2 })
+    m.register(denied)
 
     const okA = await m.subscribe(allowed, 'private-orders')
     const okD = await m.subscribe(denied, 'private-orders')
@@ -75,6 +79,7 @@ Deno.test('SC-003: a private channel rejects an unauthorized subscribe and deliv
 Deno.test('SC-003: a private channel with a null identity is denied (S1)', async () => {
     const m = new ChannelManager<User>({ authorize: () => true })
     const anon = fakeConn('anon', null)
+    m.register(anon)
     const result = await m.subscribe(anon, 'private-x')
     assertEquals(result.ok, false)
     m.broadcast('private-x', 'e', {})
@@ -84,6 +89,7 @@ Deno.test('SC-003: a private channel with a null identity is denied (S1)', async
 Deno.test('a public channel needs no authorizer', async () => {
     const m = new ChannelManager<User>() // no authorize
     const a = fakeConn('a', null)
+    m.register(a)
     const result = await m.subscribe(a, 'lobby')
     assert(result.ok)
 })

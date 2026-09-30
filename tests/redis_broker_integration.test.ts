@@ -40,6 +40,7 @@ import {
 import { hmacSha256Hex } from '../../redis/mod.ts'
 import { RedisBroadcastDriver } from '../drivers/redis.ts'
 import {
+    awaitChannelSubscribers,
     awaitSubscribers,
     connection,
     controlSecret,
@@ -48,6 +49,7 @@ import {
     waitFor,
     withFaultyInstance,
     withInstances,
+    withInterposedInstances,
     withReader,
 } from './live_realtime.ts'
 
@@ -114,7 +116,19 @@ integrationTest(
             await awaitSubscribers(reader, namespace, 2)
 
             const listener = connection('b-listener', { id: 1, name: 'Bea' })
+            b.manager.register(listener)
             await b.manager.subscribe(listener, 'private-orders')
+            // `subscribe()` resolves once the frame is on the wire, not once
+            // the broker acknowledges it (#412) — a broadcast issued right
+            // after it can race the acknowledgement and be silently dropped,
+            // since Redis pub/sub never replays. Wait for the observable
+            // signal instead of widening the deadline below.
+            await awaitChannelSubscribers(
+                reader,
+                namespace,
+                'private-orders',
+                1,
+            )
 
             a.manager.broadcast('private-orders', 'created', { id: 42 })
 
@@ -139,9 +153,20 @@ integrationTest(
             await awaitSubscribers(reader, namespace, 2)
 
             const rejected = connection('b-rejected', { id: 99, name: 'Mal' })
+            b.manager.register(rejected)
             await b.manager.subscribe(rejected, 'private-orders')
             const allowed = connection('b-allowed', { id: 3, name: 'Dee' })
+            b.manager.register(allowed)
             await b.manager.subscribe(allowed, 'private-orders')
+            // Only `allowed`'s subscribe reaches the broker — `rejected` was
+            // denied before the driver was ever touched — so this waits for
+            // exactly the one real watch to land (#412).
+            await awaitChannelSubscribers(
+                reader,
+                namespace,
+                'private-orders',
+                1,
+            )
 
             a.manager.broadcast('private-orders', 'created', { id: 7 })
             await waitFor(
@@ -178,11 +203,13 @@ integrationTest(
 
             const onA = connection('a-1', { id: 11, name: 'Ana' })
             const onB = connection('b-1', { id: 22, name: 'Bo' })
+            a.manager.register(onA)
+            b.manager.register(onB)
             await a.manager.subscribe(onA, 'presence-lobby')
             await b.manager.subscribe(onB, 'presence-lobby')
 
             // Read back with a RAW HGETALL on a client the suite owns — never
-            // through driver.listMembers(), which would route the assertion
+            // through driver.readRoster(, 1_000, []).members, which would route the assertion
             // back through the parsing layer under test (FR-008).
             await waitFor(
                 async () =>
@@ -225,8 +252,10 @@ integrationTest(
             await awaitSubscribers(reader, namespace, 2)
 
             const onA = connection('a-2', { id: 33, name: 'Cai' })
+            a.manager.register(onA)
             await a.manager.subscribe(onA, 'presence-lobby')
             const onB = connection('b-2', { id: 44, name: 'Di' })
+            b.manager.register(onB)
             await b.manager.subscribe(onB, 'presence-lobby')
 
             // Asserted on the ACTION, not a bare id: a `left` frame carries the
@@ -272,10 +301,13 @@ integrationTest(
 
             const watcherOnA = connection('watch-a', { id: 51, name: 'Wa' })
             const watcherOnB = connection('watch-b', { id: 52, name: 'Wb' })
+            a.manager.register(watcherOnA)
+            b.manager.register(watcherOnB)
             await a.manager.subscribe(watcherOnA, 'presence-lobby')
             await b.manager.subscribe(watcherOnB, 'presence-lobby')
 
             const target = connection('owned-by-a', { id: 55, name: 'Eli' })
+            a.manager.register(target)
             await a.manager.subscribe(target, 'presence-lobby')
 
             // Positive read FIRST, so the absence assertion below cannot pass
@@ -336,7 +368,7 @@ integrationTest(
     'US4: markRevoked ARMS a TTL on the index — the inert EXPIRE GT would not',
     async (namespace, reader) => {
         await withInstances(1, namespace, async ([a]) => {
-            await a.driver.markRevoked('victim-1')
+            await a.driver.markRevocation({ target: 'victim-1' })
 
             const ttl = await reader.ttlOf(keys(namespace).revocations)
             assert(
@@ -355,12 +387,12 @@ integrationTest(
     async (namespace, reader) => {
         const key = keys(namespace).revocations
         await withInstances(1, namespace, async ([short]) => {
-            await short.driver.markRevoked('victim-2')
+            await short.driver.markRevocation({ target: 'victim-2' })
             const armed = await reader.ttlOf(key)
             assert(armed > 0, `armed on first write, got ${armed}`)
 
             await withInstances(1, namespace, async ([long]) => {
-                await long.driver.markRevoked('victim-3')
+                await long.driver.markRevocation({ target: 'victim-3' })
                 const extended = await reader.ttlOf(key)
                 // A numeric FLOOR, not `>=`. Reviewed and confirmed by
                 // mutation: with `extended >= armed`, deleting the driver's
@@ -376,42 +408,46 @@ integrationTest(
 
             const afterLong = await reader.ttlOf(key)
             await withInstances(1, namespace, async ([shorter]) => {
-                await shorter.driver.markRevoked('victim-4')
+                await shorter.driver.markRevocation({ target: 'victim-4' })
                 const afterShort = await reader.ttlOf(key)
                 assert(
                     afterShort >= afterLong - 5,
                     'a SHORTER-TTL instance never shrinks the index TTL ' +
                         `(EXPIRE ... GT): ${afterLong} -> ${afterShort}`,
                 )
-            }, { revocationTtlSeconds: 30 })
+            }, {
+                revocationTtlSeconds: 30,
+                // At most half the TTL (#362), or the driver refuses to boot.
+                reconcileIntervalMs: 15_000,
+            })
         }, { revocationTtlSeconds: 300 })
     },
 )
 
 integrationTest(
-    'US4: listRevoked returns live entries, read back raw',
+    'US4: listRevocations returns live entries, read back raw',
     async (namespace, reader) => {
         await withInstances(1, namespace, async ([a]) => {
-            await a.driver.markRevoked('victim-5')
-            await a.driver.markRevoked('victim-6')
+            await a.driver.markRevocation({ target: 'victim-5' })
+            await a.driver.markRevocation({ target: 'victim-6' })
 
             const live = await reader.revoked(namespace)
             assertEquals(
                 live.sort(),
                 ['victim-5', 'victim-6'],
                 'both revocations are in the index, read via a raw ' +
-                    'ZRANGEBYSCORE rather than through driver.listRevoked()',
+                    'ZRANGEBYSCORE rather than through driver.listRevocations()',
             )
         })
     },
 )
 
 integrationTest(
-    'US4: listRevoked REAPS expired entries and keeps live ones',
+    'US4: listRevocations REAPS expired entries (REAP_REVOKED_SCRIPT) and keeps live ones',
     async (namespace, reader) => {
-        // The only test that makes LIST_REVOKED_SCRIPT actually execute against
-        // a real Redis. `listRevoked()` is the ACTION here, not the assertion —
-        // every claim below is read back raw (FR-008).
+        // The only test that makes REAP_REVOKED_SCRIPT (#359) actually execute
+        // against a real Redis. `listRevocations()` is the ACTION here, not the
+        // assertion — every claim below is read back raw (FR-008).
         await withInstances(1, namespace, async ([a]) => {
             const index = keys(namespace).revocations
             const now = await reader.now()
@@ -419,7 +455,7 @@ integrationTest(
             // One entry already expired, planted directly at a past score.
             await reader.command('ZADD', index, String(now - 60), 'stale-one')
             // One live entry, written by the driver itself.
-            await a.driver.markRevoked('live-one')
+            await a.driver.markRevocation({ target: 'live-one' })
 
             assertEquals(
                 (await reader.revokedAtAnyScore(namespace)).sort(),
@@ -427,7 +463,7 @@ integrationTest(
                 'both are present before the reaper runs',
             )
 
-            await a.driver.listRevoked?.()
+            await a.driver.listRevocations?.()
 
             assertEquals(
                 (await reader.revokedAtAnyScore(namespace)).sort(),
@@ -450,9 +486,9 @@ integrationTest(
     'US4: the index is bounded — re-revoking the same target adds no member',
     async (namespace, reader) => {
         await withInstances(1, namespace, async ([a]) => {
-            await a.driver.markRevoked('victim-7')
-            await a.driver.markRevoked('victim-7')
-            await a.driver.markRevoked('victim-7')
+            await a.driver.markRevocation({ target: 'victim-7' })
+            await a.driver.markRevocation({ target: 'victim-7' })
+            await a.driver.markRevocation({ target: 'victim-7' })
 
             assertEquals(
                 await reader.zcard(keys(namespace).revocations),
@@ -467,7 +503,7 @@ integrationTest(
     'US4: the legacy revoked SET is never written (dual-read only)',
     async (namespace, reader) => {
         await withInstances(1, namespace, async ([a]) => {
-            await a.driver.markRevoked('victim-8')
+            await a.driver.markRevocation({ target: 'victim-8' })
 
             // Enumerate what the driver ACTUALLY created, rather than probing a
             // key name this file supplies. A seed-and-re-read probe on the same
@@ -526,6 +562,7 @@ integrationTest(
             await awaitSubscribers(reader, namespace, 1)
 
             const watcher = connection('watcher', { id: 1, name: 'Wat' })
+            a.manager.register(watcher)
             await a.manager.subscribe(watcher, 'presence-lobby')
             const joinsSeen = () =>
                 watcher.frames.filter((f) =>
@@ -620,7 +657,7 @@ integrationTest(
 // Row 9 is GREEN and is an EQUIVALENT mutant, recorded rather than dropped: the
 // two forms differ only at `sep === 0`, an entry that BEGINS with a space, which
 // means an empty channel name. `ChannelManager.subscribe` refuses that
-// (#314's `#assertUsableChannel`, via `isValidName`), so no `addMember` can
+// (#314's `#assertUsableChannel`, via `isValidName`), so no `holdMember` can
 // write one. The guard being unreachable from a valid input is the desired
 // state, exactly as for row 7.
 //
@@ -728,16 +765,25 @@ integrationTest(
                 // All three in the SAME channel. One channel, three owners: a sweep
                 // that deletes the whole presence hash rather than the dead
                 // instance's fields would pass a single-owner test perfectly.
-                await survivor.manager.subscribe(
-                    connection('survivor-conn', { id: 1, name: 'Ada' }),
-                    'presence-ops',
-                )
-                await doomed.manager.subscribe(
-                    connection('doomed-conn', { id: 2, name: 'Boris' }),
-                    'presence-ops',
-                )
+                const survivorConn = connection('survivor-conn', {
+                    id: 1,
+                    name: 'Ada',
+                })
+                const doomedConn = connection('doomed-conn', {
+                    id: 2,
+                    name: 'Boris',
+                })
+                const bystanderConn = connection('bystander-conn', {
+                    id: 3,
+                    name: 'Cleo',
+                })
+                survivor.manager.register(survivorConn)
+                doomed.manager.register(doomedConn)
+                bystander.manager.register(bystanderConn)
+                await survivor.manager.subscribe(survivorConn, 'presence-ops')
+                await doomed.manager.subscribe(doomedConn, 'presence-ops')
                 await bystander.manager.subscribe(
-                    connection('bystander-conn', { id: 3, name: 'Cleo' }),
+                    bystanderConn,
                     'presence-ops',
                 )
 
@@ -906,10 +952,12 @@ integrationTest(
         await withFaultyInstance(
             namespace,
             async ({ manager }, fault) => {
-                await manager.subscribe(
-                    connection('resident-conn', { id: 1, name: 'Ada' }),
-                    'presence-ops',
-                )
+                const residentConn = connection('resident-conn', {
+                    id: 1,
+                    name: 'Ada',
+                })
+                manager.register(residentConn)
+                await manager.subscribe(residentConn, 'presence-ops')
                 await waitFor(
                     async () =>
                         (await reader.roster(namespace, 'presence-ops'))
@@ -951,10 +999,12 @@ integrationTest(
                 // has to reach the authoritative roster while the fault is
                 // still on — only the liveness `SET` is refused, every other
                 // command goes to the broker.
-                await manager.subscribe(
-                    connection('late-conn', { id: 2, name: 'Boris' }),
-                    'presence-ops',
-                )
+                const lateConn = connection('late-conn', {
+                    id: 2,
+                    name: 'Boris',
+                })
+                manager.register(lateConn)
+                await manager.subscribe(lateConn, 'presence-ops')
                 await waitFor(
                     async () =>
                         (await reader.roster(namespace, 'presence-ops'))
@@ -985,6 +1035,97 @@ integrationTest(
     },
 )
 
+/**
+ * How many heartbeat intervals a healed instance has to put a swept member
+ * back (#349 SC-001), counted in the cadence the scenario configures rather
+ * than written as a wall-clock figure.
+ *
+ * SC-001 is one interval (the next beat), plus the revocation re-check, plus
+ * the re-assert — four round trips on the one command client, behind whatever
+ * beats queue with them. The latency itself is pinned exactly under FakeTime
+ * (`lapse_rehold_349.test.ts` W1 and W1b); this live run proves the mechanism
+ * on a real broker, so its bound only has to fail LOUDLY when no repair
+ * comes, and nothing else could bring 7 back — a7 sends nothing, and no other
+ * instance holds it. Eight intervals, where a healthy run measures about one (248–271 ms over five idle-broker runs):
+ * a loaded broker or runner stays inside it, a missing repair never does.
+ */
+const LAPSE_REASSERT_INTERVALS = 8
+/** {@link LAPSE_REASSERT_INTERVALS}, in the scenario's own heartbeat cadence. */
+const LAPSE_REASSERT_BOUND_MS = SWEEP_HEARTBEAT_MS * LAPSE_REASSERT_INTERVALS
+
+integrationTest(
+    '#349 W1: a lapsed-but-alive instance puts its swept member back once its liveness writes heal',
+    async (namespace, reader) => {
+        // A is the faulty instance and B a normal peer on the same namespace
+        // and control secret, nested inside A's body. `withFaultyInstance`
+        // stays single-instance, as #310 needs; the peer is what sweeps A.
+        const options = {
+            reconcileIntervalMs: SWEEP_RECONCILE_MS,
+            livenessTtlSeconds: SWEEP_LIVENESS_SECONDS,
+            heartbeatIntervalMs: SWEEP_HEARTBEAT_MS,
+            secret: controlSecret(),
+        }
+        await withFaultyInstance(
+            namespace,
+            async (a, fault) => {
+                await withInstances(
+                    1,
+                    namespace,
+                    async ([b]) => {
+                        const bObserver = connection('b-observer', {
+                            id: 1,
+                            name: 'Ada',
+                        })
+                        const a7Conn = connection('a7', {
+                            id: 7,
+                            name: 'Boris',
+                        })
+                        b.manager.register(bObserver)
+                        a.manager.register(a7Conn)
+                        await b.manager.subscribe(bObserver, 'presence-ops')
+                        await a.manager.subscribe(a7Conn, 'presence-ops')
+                        await waitFor(
+                            async () =>
+                                (await reader.roster(namespace, 'presence-ops'))
+                                    .size === 2,
+                            'both members to reach the authoritative roster',
+                        )
+
+                        fault.breakLivenessWrites()
+                        await waitFor(
+                            async () =>
+                                !(await reader.roster(
+                                    namespace,
+                                    'presence-ops',
+                                )).has('7'),
+                            'B to sweep the lapsed instance’s member',
+                            SWEEP_TIMEOUT_MS,
+                        )
+                        assert(
+                            fault.refused() > 0,
+                            'the lapse came from refused liveness writes',
+                        )
+
+                        fault.healLivenessWrites()
+                        await waitFor(
+                            async () =>
+                                (await reader.roster(namespace, 'presence-ops'))
+                                    .has('7'),
+                            'the healed instance to re-assert its member ' +
+                                `within ${LAPSE_REASSERT_INTERVALS} heartbeat ` +
+                                `intervals (${LAPSE_REASSERT_BOUND_MS} ms) — ` +
+                                'no repair came',
+                            LAPSE_REASSERT_BOUND_MS,
+                        )
+                    },
+                    options,
+                )
+            },
+            options,
+        )
+    },
+)
+
 integrationTest(
     "US1/#288: a deployment does NOT receive a NESTED deployment's frames, on a REAL broker",
     async (namespace, reader) => {
@@ -1010,8 +1151,20 @@ integrationTest(
         const outerGot: string[] = []
         const innerGot: string[] = []
         try {
-            outer.onMessage((m) => outerGot.push(`${m.channel}/${m.event}`))
-            inner.onMessage((m) => innerGot.push(`${m.channel}/${m.event}`))
+            // The readiness probe is filtered where it is recorded, not cleared
+            // afterwards. `awaitSubscribers` counts receivers from PUBLISH's
+            // reply, which proves the broker queued the frame, not that this
+            // handler has run it. It may also publish more than one round. A
+            // late probe landed after the clear below and failed the exact-set
+            // assertion (CI, 8d8532e3). The probe channel is the harness's, never
+            // the scenario's, so dropping it here keeps every assertion exact.
+            const record =
+                (into: string[]) => (m: { channel: string; event: string }) => {
+                    if (m.channel === keys(outerPrefix).probeChannel) return
+                    into.push(`${m.channel}/${m.event}`)
+                }
+            outer.onMessage(record(outerGot))
+            inner.onMessage(record(innerGot))
             // Instrumented, not stubbed. An empty handler proves the seam
             // exists; it cannot say whether a control frame CROSSED. #288's
             // second half is that routing must never hand a control frame to
@@ -1040,14 +1193,6 @@ integrationTest(
             await outer.watchChannel('own')
             await awaitSubscribers(reader, outerPrefix, 1)
             await awaitSubscribers(reader, innerPrefix, 1)
-            // The readiness gate PUBLISHes a real event on each deployment's
-            // OWN topic and counts receivers, so both handlers have already
-            // fired once by now — `probe-ready/probe-ready`, from itself, not
-            // from the other. Dropping it here keeps the assertion below an
-            // exact set rather than a filter, which is what makes an extra
-            // arrival impossible to explain away.
-            outerGot.length = 0
-            innerGot.length = 0
 
             await inner.publish({
                 channel: 'orders',
@@ -1154,14 +1299,12 @@ integrationTest(
                 return reply.type === 'integer' ? reply.value : -1
             }
 
-            await a.manager.subscribe(
-                connection('a1', { id: 1, name: 'a1' }),
-                'alpha',
-            )
-            await b.manager.subscribe(
-                connection('b1', { id: 2, name: 'b1' }),
-                'beta',
-            )
+            const a1Conn = connection('a1', { id: 1, name: 'a1' })
+            const b1Conn = connection('b1', { id: 2, name: 'b1' })
+            a.manager.register(a1Conn)
+            b.manager.register(b1Conn)
+            await a.manager.subscribe(a1Conn, 'alpha')
+            await b.manager.subscribe(b1Conn, 'beta')
             // Both watches have to have LANDED before a count means anything.
             // The probe channel every instance holds is already proof the
             // sockets are up; this waits for these two specific subscriptions.
@@ -1213,14 +1356,12 @@ integrationTest(
                 return reply.type === 'integer' ? reply.value : -1
             }
 
-            await a.manager.subscribe(
-                connection('a1', { id: 1, name: 'a1' }),
-                'alpha',
-            )
-            await a.manager.subscribe(
-                connection('a2', { id: 3, name: 'a2' }),
-                'alpha',
-            )
+            const a1Conn = connection('a1', { id: 1, name: 'a1' })
+            const a2Conn = connection('a2', { id: 3, name: 'a2' })
+            a.manager.register(a1Conn)
+            a.manager.register(a2Conn)
+            await a.manager.subscribe(a1Conn, 'alpha')
+            await a.manager.subscribe(a2Conn, 'alpha')
             await waitFor(
                 async () => await receivers() === 1,
                 'alpha is hosted',
@@ -1263,14 +1404,12 @@ integrationTest(
                 return reply.type === 'integer' ? reply.value : -1
             }
 
-            await a.manager.subscribe(
-                connection('keep', { id: 1, name: 'keep' }),
-                'kept',
-            )
-            await a.manager.subscribe(
-                connection('drop', { id: 2, name: 'drop' }),
-                'dropped',
-            )
+            const keepConn = connection('keep', { id: 1, name: 'keep' })
+            const dropConn = connection('drop', { id: 2, name: 'drop' })
+            a.manager.register(keepConn)
+            a.manager.register(dropConn)
+            await a.manager.subscribe(keepConn, 'kept')
+            await a.manager.subscribe(dropConn, 'dropped')
             await waitFor(
                 async () =>
                     await receivers('kept') === 1 &&
@@ -1303,6 +1442,90 @@ integrationTest(
                 'the reconnect resurrected a channel whose last subscriber had ' +
                     'left — the re-issue set and the hosted set have diverged, ' +
                     'and nothing would have shown it until the next fault',
+            )
+        })
+    },
+)
+
+// ---------------------------------------------------------------------------
+// #337 — an older clear never erases a newer revocation, on a REAL broker
+// ---------------------------------------------------------------------------
+
+integrationTest(
+    '#337: an in-flight clear for an older revocation does not erase a newer one',
+    async (namespace, reader) => {
+        // The in-repo witness (`revocation_clear_race_337.test.ts`) drives the
+        // same interleaving over the fake. The fix rests on two index semantics
+        // that are the BROKER's — `ZADD GT` adds a second member for a second
+        // id, and `ZREM` removes one exact member — so the scenario is repeated
+        // here, where the fake cannot be wrong on its behalf.
+        await withInterposedInstances(2, namespace, async ([a, b]) => {
+            await awaitSubscribers(reader, namespace, 2)
+            const index = keys(namespace).revocations
+            const room = 'private-room'
+            const victim = connection('c1', { id: 71, name: 'Vic' })
+            b.manager.register(victim)
+            const kicks = () =>
+                victim.frames.filter((f) => f.includes('"unsubscribed"'))
+                    .length
+
+            // 1. B owns c1 in the room.
+            assertEquals((await b.manager.subscribe(victim, room)).ok, true)
+
+            // 2. A revokes it; B applies and its clear is HELD.
+            b.holdNextZrem()
+            await a.manager.revokeChannel('c1', room)
+            await waitFor(() => b.zremHeld(), 'B to issue its clear')
+            await waitFor(
+                () => kicks() === 1,
+                'B to apply the first revocation',
+            )
+
+            // 3. c1 re-subscribes; positive control for step 7.
+            // The probe is re-published on every poll: `subscribe` resolves once
+            // the SUBSCRIBE is written, not once the broker has acknowledged
+            // it, so a single publish can land before the room is live on B
+            // and never be delivered (failed 2 of 4 full runs of test:redis).
+            assertEquals((await b.manager.subscribe(victim, room)).ok, true)
+            await waitFor(
+                () => {
+                    a.manager.broadcast(room, 'probe', {})
+                    return victim.sawEvent('probe')
+                },
+                'a room broadcast to reach the re-subscribed c1',
+            )
+
+            // 4. A revokes again, and this frame is lost.
+            a.dropNextControl()
+            await a.manager.revokeChannel('c1', room)
+            await waitFor(
+                async () => await reader.zcard(index) === 2,
+                'both records to be on the broker — two ids, two members',
+            )
+
+            // 5. The first clear lands.
+            b.release()
+            await waitFor(
+                async () => await reader.zcard(index) === 1,
+                'the held clear to remove exactly one member',
+            )
+
+            // 6. B reconciles.
+            await b.reconcile()
+
+            // 7. The second revocation is enforced and nothing is left.
+            await waitFor(
+                () => kicks() === 2,
+                'the reconcile to enforce the revocation whose frame was lost',
+            )
+            await waitFor(
+                async () => await reader.zcard(index) === 0,
+                'the applied record to be cleared',
+            )
+            assertEquals(
+                await b.manager.unsubscribe('c1', room),
+                'not-subscribed',
+                'c1 is out of the room: the second revocation was enforced',
             )
         })
     },

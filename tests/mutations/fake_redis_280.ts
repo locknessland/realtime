@@ -41,7 +41,22 @@ const MUTATIONS: Mutation[] = [
         label: 'SET accepts an unmodelled option again',
         file: FAKE,
         edits: [["if (opts[i].toUpperCase() !== 'EX') {", 'if (false) {']],
+        // Re-proven live for #349: the anchor is intact, but `GET` is now
+        // modelled on the branch above it and left this witness's list.
         killedBy: 'SET rejects an option it does not model',
+    },
+    {
+        label: 'SET … GET answers OK',
+        file: FAKE,
+        edits: [[
+            "                return previous ?? { type: 'simple', value: 'OK' }",
+            "                return { type: 'simple', value: 'OK' }",
+        ]],
+        // (#349) The shape a `GET` accepted as a no-op would have. The
+        // heartbeat reads its lapse bit from the nil, and an `OK` is neither a
+        // nil nor a bulk: every beat on the fake would fail to decode, and a
+        // lapse would read as a failed beat.
+        killedBy: '#349 WC SET … GET answers the previous string',
     },
     {
         label: 'SET stops checking its EX argument',
@@ -50,6 +65,8 @@ const MUTATIONS: Mutation[] = [
             "                    if (\n                        raw === undefined || raw === '' ||\n                        !Number.isFinite(seconds)\n                    ) {",
             '                    if (false) {',
         ]],
+        // Re-proven live for #349: the anchor is intact; the arm now also
+        // parses `GET` in the same loop.
         killedBy: 'SET refuses an EX with a missing or unparseable value',
     },
     {
@@ -59,6 +76,8 @@ const MUTATIONS: Mutation[] = [
             'if (expireAt === undefined) this.#keyExpiry.delete(key)\n                else this.#keyExpiry.set(key, expireAt)',
             'if (expireAt !== undefined) this.#keyExpiry.set(key, expireAt)',
         ]],
+        // Re-proven live for #349: the anchor is intact; the arm now reads
+        // the previous value (for `GET`) just above it.
         killedBy: 'a plain SET clears an existing TTL',
     },
     {
@@ -179,11 +198,13 @@ const MUTATIONS: Mutation[] = [
         killedBy: 'HSET and HDEL take many field/value pairs',
     },
     {
+        // Re-anchored for #414: `#assertHashKey(key)` sits between the
+        // destructure and the arity check.
         label: 'HSET half-applies an odd argument list again',
         file: FAKE,
         edits: [[
-            'const [key, ...pairs] = rest\n                if (pairs.length === 0 || pairs.length % 2 !== 0) {',
-            'const [key, ...pairs] = rest\n                if (pairs.length === 0) {',
+            'this.#assertHashKey(key)\n                if (pairs.length === 0 || pairs.length % 2 !== 0) {',
+            'this.#assertHashKey(key)\n                if (pairs.length === 0) {',
         ]],
         killedBy: 'an odd HSET argument list is refused',
     },
@@ -216,6 +237,78 @@ const MUTATIONS: Mutation[] = [
             'if (false) {\n                    this.#reject(\n                        `FakeRedis: SMEMBERS takes one key',
         ]],
         killedBy: 'the arms with no options refuse extra arguments',
+    },
+    {
+        // (#358 F1) An SSCAN with no COUNT answered at Redis's default of 10:
+        // a page its caller does not bound, which is the defect #358 closes.
+        label: 'SSCAN accepts a missing COUNT again',
+        file: FAKE,
+        edits: [[
+            "                if (count === undefined) {\n                    this.#reject(\n                        'FakeRedis: SSCAN without COUNT",
+            "                count ??= 10\n                if (false) {\n                    this.#reject(\n                        'FakeRedis: SSCAN without COUNT",
+        ]],
+        killedBy: '#358 WC SSCAN refuses a missing COUNT',
+    },
+    {
+        // (#358 F2) MATCH silently ignored — the #276 shape: the caller
+        // believes the page is filtered, and the fake hands it every member.
+        label: 'SSCAN accepts MATCH again',
+        file: FAKE,
+        edits: [[
+            "                    if (option !== 'COUNT') {",
+            "                    if (option === 'MATCH') continue\n                    if (option !== 'COUNT') {",
+        ]],
+        // The witness's "any option but COUNT" clause — its missing-COUNT
+        // clause is F1's.
+        killedBy: '#358 WC SSCAN refuses a missing COUNT, any option but COUNT',
+    },
+    {
+        // (#359 F1) A ZSCAN with no COUNT answered at Redis's default of 10:
+        // a revocation page its caller does not bound — the defect #359
+        // closes, and the refusal that pins `REVOCATION_SCAN_COUNT` on the
+        // driver's read (#359 M2a).
+        label: 'ZSCAN accepts a missing COUNT again',
+        file: FAKE,
+        edits: [[
+            "                if (pageSize === undefined) {\n                    this.#reject(\n                        'FakeRedis: ZSCAN without COUNT",
+            "                pageSize ??= 10\n                if (false) {\n                    this.#reject(\n                        'FakeRedis: ZSCAN without COUNT",
+        ]],
+        killedBy: '#359 WC ZSCAN refuses a missing COUNT',
+    },
+    {
+        // (#359 F2) MATCH silently ignored on the revocation index — the
+        // caller believes the page is filtered, and the fake hands it every
+        // record.
+        label: 'ZSCAN accepts MATCH again',
+        file: FAKE,
+        edits: [[
+            "                    if (flag !== 'COUNT') {",
+            "                    if (flag === 'MATCH') continue\n                    if (flag !== 'COUNT') {",
+        ]],
+        killedBy: '#359 WC ZSCAN refuses a missing COUNT, any option but COUNT',
+    },
+    {
+        // (#358 F3) A cursor this fake never issued answered as a plausible
+        // `[0, []]` — an empty, finished iteration — so a test driving the
+        // scan with a made-up cursor reads "nothing left" instead of failing.
+        label: 'the scan core answers a cursor past its table again',
+        file: FAKE,
+        edits: [[
+            '        if (from >= SCAN_TABLE_SLOTS) {\n',
+            '        if (false) {\n',
+        ]],
+        killedBy: '#358 WC SSCAN refuses a missing cursor and a cursor past',
+    },
+    {
+        // (#358 F4) A per-key ceiling only: a caller that moves to a fresh
+        // key on every call never trips it, and hangs instead of failing.
+        label: 'the scan core loses its cumulative call ceiling',
+        file: FAKE,
+        edits: [[
+            ' || this.#scanTotal > SCAN_CALLS_TOTAL) {',
+            ') {',
+        ]],
+        killedBy: '#358 the scan core refuses past its cumulative call ceiling',
     },
     {
         label:

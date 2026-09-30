@@ -12,7 +12,7 @@
  * layout the suite reads back, what counts as an authoritative read-back, where
  * the control secret comes from, and how an instance is created and disposed.
  *
- * **On read-backs.** `RedisBroadcastDriver.listMembers()` and `listRevoked()`
+ * **On read-backs.** `RedisBroadcastDriver.readRoster(, 1_000, []).members` and `listRevocations()`
  * both read from Redis, so asserting through them would satisfy a naive reading
  * of "assert cross-process state" while routing every assertion straight back
  * through the parsing and semantics layer this suite exists to backstop. A suite
@@ -68,6 +68,7 @@ export function keys(prefix: string): {
     presence: (channel: string) => string
     instances: string
     revocations: string
+    revocationFloor: string
     ownedPattern: string
     alivePattern: string
     controlTopic: string
@@ -78,6 +79,8 @@ export function keys(prefix: string): {
         presence: (channel: string) => `${prefix}__presence:${channel}`,
         instances: `${prefix}__instances`,
         revocations: `${prefix}__revocations`,
+        // The revocation floor (#380): one member per distinct live TTL.
+        revocationFloor: `${prefix}__revocation-floor`,
         // The owning instance id is `crypto.randomUUID()` inside the driver and
         // is not reachable from here, so these two are patterns, not names.
         ownedPattern: `${prefix}__owned:*`,
@@ -426,6 +429,147 @@ export async function withFaultyInstance<T>(
 }
 
 /**
+ * One live instance whose command port can lose one control frame and delay
+ * one clear, with its revocation reconcile reachable on demand (#337).
+ */
+export interface InterposedInstance extends LiveInstance {
+    /** Drop the next `PUBLISH` to the control topic — the frame is "lost". */
+    dropNextControl(): void
+    /** Hold the next `ZREM` until {@link release}; it reaches the broker then. */
+    holdNextZrem(): void
+    /**
+     * Whether a `ZREM` is being held. A boolean to poll, not a promise to
+     * await: a driver that never issues the clear would leave a promise pending
+     * forever and hang the run instead of failing it.
+     */
+    zremHeld(): boolean
+    /** Send the held `ZREM` to the broker. */
+    release(): void
+    /** Run this instance's revocation reconcile once, as a reconnect would. */
+    reconcile(): Promise<void>
+}
+
+/**
+ * Run `body` with `count` live instances whose command ports are interposed,
+ * for driving the #337 interleaving against a REAL broker.
+ *
+ * Built from injected ports for the same reason as
+ * {@link withFaultyInstance}: the command port has to be wrapped, so this owns
+ * its sockets. The reconcile is captured from the subscriber's reconnect seam
+ * rather than left to the timer, so no tick can fire between two steps and
+ * reorder the scenario — the cadence is left at a minute.
+ *
+ * @param count - How many instances to build.
+ * @param namespace - The run namespace, used as each driver's `prefix`.
+ * @param body - The scenario, receiving the instances in construction order.
+ * @returns Whatever `body` returns.
+ */
+export async function withInterposedInstances<T>(
+    count: number,
+    namespace: string,
+    body: (instances: InterposedInstance[]) => Promise<T>,
+): Promise<T> {
+    const secret = controlSecret()
+    const config = brokerConfig()
+    const controlTopic = keys(namespace).controlTopic
+    const instances: InterposedInstance[] = []
+    const sockets: { close(): Promise<void> }[] = []
+    try {
+        for (let index = 0; index < count; index++) {
+            const client = new RedisClient(config)
+            const subscriber = new RedisSubscribeConnection(config)
+            sockets.push(subscriber, client)
+            let dropNextControl = false
+            let holdNextZrem = false
+            let held: (() => void) | undefined
+            const command: RedisCommandClient = {
+                command: (...args: string[]) => {
+                    if (
+                        dropNextControl && args[0] === 'PUBLISH' &&
+                        args[1] === controlTopic
+                    ) {
+                        dropNextControl = false
+                        return Promise.resolve({ type: 'integer', value: 0 })
+                    }
+                    if (holdNextZrem && args[0] === 'ZREM') {
+                        holdNextZrem = false
+                        return new Promise((resolve, reject) => {
+                            held = () =>
+                                void client.command(...args).then(
+                                    resolve,
+                                    reject,
+                                )
+                        })
+                    }
+                    return client.command(...args)
+                },
+            }
+            let reconcile: (() => void | Promise<void>) | undefined
+            // Every member delegates to the real connection, bound to it so its
+            // private fields resolve; only the reconnect seam is observed.
+            const port = new Proxy(subscriber, {
+                get(target, prop) {
+                    if (prop === 'onReconnect') {
+                        return (handler: () => void | Promise<void>) => {
+                            reconcile = handler
+                            target.onReconnect(handler)
+                        }
+                    }
+                    const value = Reflect.get(target, prop, target)
+                    return typeof value === 'function'
+                        ? value.bind(target)
+                        : value
+                },
+            })
+            const driver = new RedisBroadcastDriver(command, port, {
+                prefix: namespace,
+                control: { secret },
+                presence: { reconcileIntervalMs: 60_000 },
+                revocationTtlSeconds: 300,
+            })
+            const manager = new ChannelManager<TestUser>({
+                driver,
+                authorize: defaultAuthorize,
+            })
+            await driver.watchChannel(keys(namespace).probeChannel)
+            instances.push({
+                driver,
+                manager,
+                dropNextControl: () => void (dropNextControl = true),
+                holdNextZrem: () => void (holdNextZrem = true),
+                zremHeld: () => held !== undefined,
+                release: () => {
+                    if (!held) throw new Error('no ZREM is being held')
+                    held()
+                },
+                reconcile: async () => {
+                    if (!reconcile) {
+                        throw new Error('the reconcile seam was not registered')
+                    }
+                    await reconcile()
+                },
+            })
+        }
+        return await body(instances)
+    } finally {
+        for (const instance of instances) {
+            await instance.driver.close().catch((error) =>
+                console.warn(
+                    `[live-realtime] an interposed driver failed to close: ${error}`,
+                )
+            )
+        }
+        for (const socket of sockets) {
+            await socket.close().catch((error) =>
+                console.warn(
+                    `[live-realtime] an interposed socket failed to close: ${error}`,
+                )
+            )
+        }
+    }
+}
+
+/**
  * Block until `count` instances are actually subscribed to the run's patterns.
  *
  * Redis pub/sub is at-most-once and `psubscribe` is fire-and-forget, so a
@@ -494,6 +638,89 @@ export async function awaitSubscribers(
             `[live-realtime] ${count} instance(s) never subscribed under ` +
                 `${namespace}: last seen ${events} event and ${control} ` +
                 'control subscriber(s)',
+        )
+    }
+}
+
+/**
+ * Block until a specific channel's watch is actually live on the broker —
+ * the **readiness signal `manager.subscribe()` does not give you** (#412).
+ *
+ * `ChannelManager.subscribe()` resolves once the underlying
+ * `SUBSCRIBE`/`PSUBSCRIBE` frame has reached the socket, never once the
+ * broker has acknowledged it —
+ * `RedisSubscribeConnection.subscribeOne`'s own JSDoc calls this out by name:
+ * "the frame reached the socket, or you were told it did not — never
+ * 'delivery has started'". A caller that needs delivery, this function's
+ * whole reason to exist, must observe delivery itself, exactly as
+ * {@link awaitSubscribers} already does for "is any instance listening at
+ * all" — this is the same technique aimed at ONE channel's watch instead.
+ *
+ * **Measured, not assumed (#412).** Instrumenting the exact sequence
+ * `awaitSubscribers` → `manager.subscribe(listener, channel)` → immediate
+ * `manager.broadcast(...)` against a local Redis 7 container: the `subscribe`
+ * call itself resolves in ~0.1 ms (confirming it returns at the WRITE, not
+ * the acknowledgement), while the broker's own receiver count for the
+ * channel's topic took a further 0.2–4.8 ms after that to report a live
+ * subscriber. A broadcast issued in that window is not merely delayed —
+ * Redis pub/sub has no replay, so it is dropped forever. Over 30
+ * back-to-back runs with no barrier, 4 (~13%) never delivered within 300 ms
+ * — consistent with the reported "1 failure in 2" once CI's shared runner
+ * widens the same window. Every run that DID deliver did so in 1.5–3.0 ms,
+ * which is why widening the 5 s `waitFor` would have hidden the loss rather
+ * than fixed it: a genuinely lost publish times out at any deadline.
+ *
+ * Uses the same PUBLISH-and-count-receivers technique as
+ * {@link awaitSubscribers} and the `#295` suites, on the channel's own event
+ * topic (`keys(namespace).presence` is presence-specific; a plain data
+ * channel's topic is `${namespace}__event:${channel}`, the same format
+ * `probeTopic` uses for the reserved probe channel). The probe event name is
+ * deliberately never `'created'` or any name a scenario asserts on, so a
+ * caller's own `sawEvent` check cannot be satisfied by the probe itself.
+ *
+ * @param reader - A raw client to publish the probe on.
+ * @param namespace - The run namespace.
+ * @param channel - The channel whose watch must be live on the broker.
+ * @param count - How many receivers the broker must report.
+ * @param timeoutMs - How long to wait before giving up.
+ * @throws {Error} When the deadline passes with the count still short.
+ * @example
+ * ```typescript
+ * await b.manager.subscribe(listener, 'private-orders')
+ * await awaitChannelSubscribers(reader, namespace, 'private-orders', 1)
+ * a.manager.broadcast('private-orders', 'created', { id: 42 })
+ * ```
+ */
+export async function awaitChannelSubscribers(
+    reader: Reader,
+    namespace: string,
+    channel: string,
+    count: number,
+    timeoutMs = 10_000,
+): Promise<void> {
+    const topic = `${namespace}__event:${channel}`
+    let seen = 0
+    try {
+        await waitFor(
+            async () => {
+                const reply = await reader.command(
+                    'PUBLISH',
+                    topic,
+                    JSON.stringify({
+                        event: '__readiness_probe__',
+                        data: null,
+                    }),
+                )
+                seen = reply.type === 'integer' ? reply.value : 0
+                return seen >= count
+            },
+            `${count} subscriber(s) on channel ${channel} under ${namespace}`,
+            timeoutMs,
+        )
+    } catch {
+        throw new Error(
+            `[live-realtime] channel ${channel} never reached ${count} ` +
+                `subscriber(s) under ${namespace}: last saw ${seen}`,
         )
     }
 }

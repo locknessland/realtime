@@ -24,7 +24,19 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'the channel assertion removed entirely',
         file: MANAGER,
-        edits: [['        this.#assertUsableChannel(channel)\n', '']],
+        // ANCHORED WITH ITS FOLLOWING LINE (#332). `revokeChannel` asserts
+        // the same way, so the bare call now appears twice in this file and a
+        // one-line anchor is ambiguous. The harness reports that as a dead
+        // mutant rather than silently mutating the wrong site — which is the
+        // behaviour that makes repairing it cheap.
+        //
+        // The FOLLOWING line, not the preceding one: a five-line comment sits
+        // between the id assertion and this one, so an anchor reaching
+        // backwards spans prose that any edit to the reasoning would break.
+        edits: [[
+            '        this.#assertUsableChannel(channel)\n        const kind = channelKind(channel)',
+            '        const kind = channelKind(channel)',
+        ]],
         killedBy: 'subscribe refuses a channel the WebSocket wire would refuse',
     },
     {
@@ -41,7 +53,10 @@ const MUTATIONS: Mutation[] = [
             'the assertion moved AFTER the authorizer — the side effect is spent anyway',
         file: MANAGER,
         edits: [
-            ['        this.#assertUsableChannel(channel)\n', ''],
+            [
+                '        this.#assertUsableChannel(channel)\n        const kind = channelKind(channel)',
+                '        const kind = channelKind(channel)',
+            ],
             [
                 '        let set = this.subscriptions.get(channel)',
                 '        this.#assertUsableChannel(channel)\n        let set = this.subscriptions.get(channel)',
@@ -52,9 +67,12 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'UNSUBSCRIBE guarded too — cleanup stops being total',
         file: MANAGER,
+        // ANCHOR REPAIRED (#332): `unsubscribe` now reports a `LeaveOutcome`
+        // and its signature spans four lines, so the old one-line anchor
+        // matched nothing. The source moved, the guard remains.
         edits: [[
-            '    async unsubscribe(clientId: string, channel: string): Promise<void> {',
-            '    async unsubscribe(clientId: string, channel: string): Promise<void> {\n        this.#assertUsableChannel(channel)',
+            '    ): Promise<LeaveOutcome> {',
+            '    ): Promise<LeaveOutcome> {\n        this.#assertUsableChannel(channel)',
         ]],
         killedBy: 'UNSUBSCRIBE is not guarded',
     },

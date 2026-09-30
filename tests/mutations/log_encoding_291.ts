@@ -80,18 +80,23 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'durable-revocation WARN back to passing the error object',
         file: MANAGER,
+        // Re-anchored by #395 part 2: the WARN gained its own try/catch
+        // guard (a throwing sink must not skip the apply below), nesting it
+        // one indent level deeper.
         edits: [[
-            '                    `by reconcile: ${renderError(error)}`,\n            )',
-            "                    'by reconcile',\n                error,\n            )",
+            '                        `by reconcile: ${renderError(error)}`,\n                )',
+            "                        'by reconcile',\n                    error,\n                )",
         ]],
         killedBy: 'durable-revocation WARN renders the error and stays a WARN',
     },
     {
         label: 'the default publish sink back to passing the error object',
         file: MANAGER,
+        // Re-anchored by #395: the default line is written through
+        // `writeMarkedFallback`; the mutant puts the object form back.
         edits: [[
-            '`realtime: broadcast publish failed: ${renderError(error)}`,',
-            "'realtime: broadcast publish failed',\n                    error,",
+            '            ((error) => writeMarkedFallback(PUBLISH_FAILED, error))\n',
+            '            ((error) => console.error(PUBLISH_FAILED, error))\n',
         ]],
         killedBy: 'the default onPublishError renders the error',
     },
@@ -114,9 +119,11 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'the websocket default sink back to passing the error object',
         file: SOCKET,
+        // Re-anchored by #391: the default line is written through
+        // `writeMarkedFallback`; the mutant puts the object form back.
         edits: [[
-            '`realtime: unhandled websocket error: ${renderError(error)}`,',
-            "'realtime: unhandled websocket error',\n                error,",
+            '        writeMarkedFallback(UNHANDLED_WEBSOCKET_ERROR, error)\n',
+            "        console.error('realtime: unhandled websocket error', error)\n",
         ]],
         killedBy: 'the default websocket error sink renders the error',
     },
@@ -146,9 +153,10 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'the durable-revocation WARN raised to console.error',
         file: MANAGER,
+        // Re-anchored by #395 part 2, same reason as the row above.
         edits: [[
-            "console.warn(\n                'realtime: the durable revocation write failed",
-            "console.error(\n                'realtime: the durable revocation write failed",
+            "console.warn(\n                    'realtime: the durable revocation write failed",
+            "console.error(\n                    'realtime: the durable revocation write failed",
         ]],
         killedBy: 'durable-revocation WARN renders the error and stays a WARN',
     },

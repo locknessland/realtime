@@ -74,7 +74,13 @@ Deno.test('#308 the WARN names WHICH trigger failed', async () => {
         )
 
         warn.messages.length = 0
-        await time.tickAsync(10_000)
+        // The seam's one retry runs at +1 s; drained (#359 FR-015) so it has
+        // ENDED before the timer is due — a timer that fires while a pass is
+        // still in flight starts nothing, and one `tickAsync` does not settle
+        // the pass it fires before the next timer.
+        await time.tickAsync(1_500)
+        await time.runMicrotasks()
+        await time.tickAsync(8_500)
         assert(
             warn.messages.some((m) => m.includes('(timer)')),
             `the timer-triggered failure did not name itself: ${warn.messages}`,

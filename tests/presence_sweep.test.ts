@@ -49,11 +49,14 @@ Deno.test('SC-005: a crashed instance leaves no permanent ghost roster members',
     const a = driver(redis)
     const b = driver(redis)
     try {
-        await a.addMember('presence-lobby', { id: 1, info: { name: 'A' } })
-        await b.addMember('presence-lobby', { id: 2, info: { name: 'B' } })
+        await a.holdMember('presence-lobby', { id: 1, info: { name: 'A' } })
+        await b.holdMember('presence-lobby', { id: 2, info: { name: 'B' } })
 
         // Both members are authoritatively "here" from either instance's view.
-        assertEquals(ids(await b.listMembers('presence-lobby')), [1, 2])
+        assertEquals(
+            ids((await b.readRoster!('presence-lobby', 1_000, [])).members),
+            [1, 2],
+        )
 
         // Instance A crashes: it stops heartbeating (close clears its timers) but
         // leaves its roster entries behind, exactly as a real crash would.
@@ -64,7 +67,10 @@ Deno.test('SC-005: a crashed instance leaves no permanent ghost roster members',
         await time.tickAsync(3_500)
         await flushMicrotasks()
 
-        assertEquals(ids(await b.listMembers('presence-lobby')), [2])
+        assertEquals(
+            ids((await b.readRoster!('presence-lobby', 1_000, [])).members),
+            [2],
+        )
     } finally {
         await b.close()
         time.restore()

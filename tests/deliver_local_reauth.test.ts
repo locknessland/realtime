@@ -65,6 +65,7 @@ Deno.test('FR-011/S6: a received message fans only to the local subscription set
     })
 
     const authorized = fakeConn('ok', { id: 1 })
+    manager.register(authorized)
     const denied = fakeConn('no', { id: 2 })
     // Both connections are registered/known to the manager…
     manager.register(denied)

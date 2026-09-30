@@ -56,7 +56,14 @@ const MUTATIONS: Mutation[] = [
     {
         label: 'the evict() boundary guard removed',
         file: MANAGER,
-        edits: [['        this.#assertUsableId(clientId)\n', '']],
+        // ANCHORED WITH ITS FOLLOWING COMMENT (#332). `revokeChannel` asserts
+        // the same id the same way, so the bare call now appears twice in this
+        // file. Anchoring on evict's own next line keeps this row pointed at
+        // evict rather than at whichever site happens to come first.
+        edits: [[
+            '        this.#assertUsableId(clientId)\n        // Durable first',
+            '        // Durable first',
+        ]],
         killedBy: 'evict() refuses an out-of-charset id',
     },
     {
@@ -112,13 +119,19 @@ const MUTATIONS: Mutation[] = [
         // So this row's meaning CHANGED without its text changing: it is now
         // the only thing standing between a broker-sourced member and
         // `revokeLocal`. Removing the filter is a kill, not an equivalence.
-        // The reason is transcribed into `listRevoked`'s docstring, where a
+        // The reason is transcribed into the decoder's docstring, where a
         // reader of the code finds it rather than a reader of this battery.
-        label: 'the reconcile filter dropped on the sorted-set path',
+        //
+        // #332 MOVED the anchor and made the row strictly more load-bearing.
+        // The filter used to sit inline in `listRevoked`; it now lives in
+        // `#decodeRevocation`, because the seam returns `Revocation` records
+        // rather than raw ids. The source moved, the guard remains — so the
+        // anchor is repaired and the row lives.
+        label: 'the reconcile filter dropped on the bare sorted-set member',
         file: DRIVER,
         edits: [[
-            'if (id && isValidName(id)) live.add(id)',
-            'if (id) live.add(id)',
+            '        if (!parts.every((part) => isValidName(part))) return undefined\n',
+            '',
         ]],
         killedBy: 'reconcile drops a broker-injected id',
     },

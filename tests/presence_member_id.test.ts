@@ -12,7 +12,8 @@
  */
 
 import { assert, assertEquals } from '@std/assert'
-import { ChannelManager, PresenceMemberIdError } from '../manager.ts'
+import { ChannelManager } from '../manager.ts'
+import { PresenceMemberIdError } from '../presence_member.ts'
 import { MAX_NAME_LENGTH } from '../protocol.ts'
 import type { Connection } from '../types.ts'
 import type { PresenceMember } from '../channel.ts'
@@ -124,13 +125,20 @@ Deno.test('#306 a NON-FINITE numeric id is refused, a large finite one is not', 
         const m = managerReturning({ id })
         const c = conn(crypto.randomUUID())
         m.register(c)
-        let threw = false
+        let threw: unknown
         try {
             await m.subscribe(c, 'presence-room')
-        } catch {
-            threw = true
+        } catch (error) {
+            threw = error
         }
-        assert(threw, `a non-finite numeric id was accepted: ${id}`)
+        // THE NAMED ERROR, not any throw (#350). Since admission parses the
+        // member, a NaN id also serializes to `null` and fails the wire check
+        // as a PresenceMemberShapeError — so "it threw" would stay green with
+        // the finiteness rule deleted, naming the wrong defect.
+        assert(
+            threw instanceof PresenceMemberIdError,
+            `a non-finite numeric id was not refused as an id: ${id} (${threw})`,
+        )
     }
 
     // And the case that forced length-over-charset: String(1e21) is "1e+21",

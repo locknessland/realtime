@@ -66,14 +66,15 @@ Deno.test('US4: a disconnect on the owning instance fans a `left` to presence su
     const b = instance(redis)
     try {
         const w = fakeConn('w', { id: 10, name: 'Wendy' }) // watcher on A
+        a.manager.register(w)
         const x = fakeConn('x', { id: 1, name: 'Xavier' }) // member on B
+        b.manager.register(x)
         await a.manager.subscribe(w, 'presence-lobby')
         await b.manager.subscribe(x, 'presence-lobby')
 
         assert(
-            (await a.driver.listMembers('presence-lobby')).some((m) =>
-                m.id === 1
-            ),
+            (await a.driver.readRoster!('presence-lobby', 1_000, [])).members
+                .some((m) => m.id === 1),
             'X should be on the authoritative roster before the disconnect',
         )
 
@@ -82,9 +83,8 @@ Deno.test('US4: a disconnect on the owning instance fans a `left` to presence su
 
         // X is removed from the authoritative roster.
         assertEquals(
-            (await a.driver.listMembers('presence-lobby')).some((m) =>
-                m.id === 1
-            ),
+            (await a.driver.readRoster!('presence-lobby', 1_000, [])).members
+                .some((m) => m.id === 1),
             false,
             'X should be gone from the authoritative roster',
         )

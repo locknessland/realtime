@@ -43,7 +43,11 @@ const MUTATIONS: Mutation[] = [
         label:
             'the TIMER retries too — a self-inflicted load spike while the broker is down',
         file: DRIVER,
-        edits: [["            if (trigger !== 'reconnect') return\n", '']],
+        // Re-anchored for #362: the guard now returns the pass outcome.
+        edits: [[
+            "            if (trigger !== 'reconnect') return 'failed'\n",
+            '',
+        ]],
         killedBy: 'a failed TIMER reconcile is NOT retried',
     },
     {

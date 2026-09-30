@@ -24,6 +24,11 @@ import { buildEvents } from '../websocket.ts'
 import { forwardEvent } from '../events_bridge.ts'
 import type { BroadcastDriver } from '../driver.ts'
 import type { Connection, WSContext } from '../types.ts'
+import {
+    assertRosterRead,
+    asWindow,
+    rosterReadCount,
+} from './roster_window_double.ts'
 
 /** A DSN-bearing failure — the shape a driver teardown actually produces. */
 const DSN_FAILURE = () =>
@@ -123,14 +128,15 @@ const fakeSocket = () => ({ send() {}, close() {} })
 const tick = () => new Promise((r) => setTimeout(r, 0))
 
 Deno.test('#291 evict-teardown WARN renders the error and encodes the client id', async () => {
-    // A roster whose removeMember rejects makes disconnect() throw, which is
+    // A roster whose releaseMember rejects makes disconnect() throw, which is
     // the only way into revokeLocal's catch.
     const driver: BroadcastDriver = {
         publish: () => Promise.resolve(),
         onMessage: () => {},
-        addMember: () => Promise.resolve(),
-        listMembers: () => Promise.resolve([]),
-        removeMember: () => Promise.reject(DSN_FAILURE()),
+        holdMember: () => Promise.resolve({ arrived: true }),
+        readRoster: (_channel, limit, selfIds) =>
+            asWindow(Promise.resolve([]), limit, selfIds),
+        releaseMember: () => Promise.reject(DSN_FAILURE()),
     }
     // #304 made a hostile id UNCONSTRUCTIBLE: `register` refuses anything
     // outside `isValidName`, so a bidi override can no longer BE a connection
@@ -146,7 +152,9 @@ Deno.test('#291 evict-teardown WARN renders the error and encodes the client id'
     const m = new ChannelManager<User>({ driver, authorize: () => true })
     const conn = fakeConn(hostile)
     m.handlerHooks({}).onOpen?.(conn)
+    const rosterReadsBefore = rosterReadCount()
     const sub = await m.subscribe(conn, 'presence-room')
+    assertRosterRead(rosterReadsBefore)
     assertEquals(sub.ok, true, 'the fixture must actually subscribe')
 
     using captured = captureConsole()
@@ -168,10 +176,17 @@ Deno.test('#291 evict-teardown WARN renders the error and encodes the client id'
 })
 
 Deno.test('#291 durable-revocation WARN renders the error and stays a WARN', async () => {
+    // ALL THREE revocation members, not just the failing one. They are
+    // feature-detected as a SET (#332), so a double presenting `markRevocation`
+    // alone is narrowed to "no revocation store at all" — the write is never
+    // attempted, the WARN never fires, and this test would pass its own
+    // assertion vacuously if it did not assert the line actually appeared.
     const driver: BroadcastDriver = {
         publish: () => Promise.resolve(),
         onMessage: () => {},
-        markRevoked: () => Promise.reject(DSN_FAILURE()),
+        markRevocation: () => Promise.reject(DSN_FAILURE()),
+        listRevocations: () => Promise.resolve([]),
+        clearRevocation: () => Promise.resolve(),
     }
     const m = new ChannelManager<User>({ driver })
 
@@ -413,4 +428,111 @@ Deno.test('#291 captureConsole restores both sinks on dispose', () => {
     }
     assertEquals(console.warn, realWarn, 'console.warn was left patched')
     assertEquals(console.error, realError, 'console.error was left patched')
+})
+
+Deno.test('#323 the presence WARNs name the channel and NOTHING from the member', async () => {
+    // `manager.ts` states in a comment that these paths deliberately carry
+    // nothing derived from the member — `info` is arbitrary application PII and
+    // log stores are read more widely than the data they describe. A comment is
+    // a claim; this is what checks it. Related: #326, which bounds `info`.
+    const SECRET = 'st-tropez-holiday-photo'
+    const member = { id: 'u1', info: { bio: SECRET } }
+
+    // Path 1 — the fan-out warn: a socket that cannot receive.
+    {
+        const driver: BroadcastDriver = {
+            publish: () => {},
+            onMessage: () => {},
+            holdMember: () => Promise.resolve({ arrived: true }),
+            releaseMember: () => Promise.resolve({ gone: true }),
+            readRoster: (_channel, limit, selfIds) =>
+                asWindow(Promise.resolve([member]), limit, selfIds),
+        }
+        // TWO MEMBER IDS, not one (#344). A `joined` never reaches a connection
+        // of its own member id, so a deaf socket sharing the newcomer's id is
+        // no longer in the fan-out and this path would warn about nothing.
+        let joins = 0
+        const m = new ChannelManager<User>({
+            driver,
+            authorize: () => joins++ === 0 ? { ...member, id: 'u0' } : member,
+        })
+        const deaf = fakeConn('deaf')
+        m.register(deaf)
+        deaf.send = () => {
+            throw new TypeError('socket is closing')
+        }
+        const rosterReadsBefore = rosterReadCount()
+        await m.subscribe(deaf, 'presence-room')
+        assertRosterRead(rosterReadsBefore)
+
+        using captured = captureConsole()
+        const newcomer = fakeConn('newcomer')
+        m.register(newcomer)
+        await m.subscribe(newcomer, 'presence-room')
+        const line = captured.lines.map((l) => l.text).join('\n')
+        assertStringIncludes(line, 'presence-room')
+        assert(
+            !line.includes(SECRET),
+            `the fan-out WARN leaked member.info: ${line}`,
+        )
+    }
+
+    // Path 2 — the control-publish warn: the announcement is lost, not the join.
+    {
+        const driver: BroadcastDriver = {
+            publish: () => {},
+            onMessage: () => {},
+            holdMember: () => Promise.resolve({ arrived: true }),
+            releaseMember: () => Promise.resolve({ gone: true }),
+            readRoster: (_channel, limit, selfIds) =>
+                asWindow(Promise.resolve([member]), limit, selfIds),
+            onControl: () => {},
+            publishControl: () => Promise.reject(DSN_FAILURE()),
+        }
+        const m = new ChannelManager<User>({
+            driver,
+            authorize: () => member,
+        })
+        using captured = captureConsole()
+        const rosterReadsBefore = rosterReadCount()
+        const c1 = fakeConn('c1')
+        m.register(c1)
+        const result = await m.subscribe(c1, 'presence-room')
+        assertRosterRead(rosterReadsBefore)
+        assertEquals(result.ok, true, 'the join still commits')
+        const line = captured.lines.map((l) => l.text).join('\n')
+        assertStringIncludes(line, 'presence-room')
+        assert(!line.includes(SECRET), `the control WARN leaked info: ${line}`)
+        assert(
+            !line.includes('S3cr3t'),
+            'and renderError redacted the DSN credential',
+        )
+    }
+
+    // Path 3 — the snapshot warn: the here-roster could not be read.
+    {
+        const driver: BroadcastDriver = {
+            publish: () => {},
+            onMessage: () => {},
+            holdMember: () => Promise.resolve({ arrived: true }),
+            releaseMember: () => Promise.resolve({ gone: true }),
+            readRoster: (_channel, limit, selfIds) =>
+                asWindow(Promise.reject(DSN_FAILURE()), limit, selfIds),
+        }
+        const m = new ChannelManager<User>({
+            driver,
+            authorize: () => member,
+        })
+        using captured = captureConsole()
+        const rosterReadsBefore = rosterReadCount()
+        const c1 = fakeConn('c1')
+        m.register(c1)
+        const result = await m.subscribe(c1, 'presence-room')
+        // 'local' below is the FALLBACK, not a roster-less driver: the read ran.
+        assertRosterRead(rosterReadsBefore)
+        assertEquals(result.here?.source, 'local')
+        const line = captured.lines.map((l) => l.text).join('\n')
+        assertStringIncludes(line, 'presence-room')
+        assert(!line.includes(SECRET), `the snapshot WARN leaked info: ${line}`)
+    }
 })

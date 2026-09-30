@@ -344,12 +344,16 @@ Deno.test('FR-011: an oversized frame is refused at PUBLISH, not only at ingest'
     const a = publisher(redis)
     try {
         const warnings = await warningsFrom(async () => {
+            // REJECTS since #326 — caught here so the warning assertion below
+            // still runs. That it rejects at all is asserted by
+            // `control_refusal.test.ts`; this test is about the wire and the
+            // log, and swallowing the rejection here keeps it about those.
             await a.driver.publishControl({
                 kind: 'presence-join',
                 target: 'conn-1',
                 channel: 'presence-lobby',
                 member: { id: 1, info: { blob: 'x'.repeat(20_000) } },
-            })
+            }).catch(() => {})
         })
         assertEquals(a.captured.length, 0, 'nothing reached the wire')
         assert(

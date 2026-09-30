@@ -23,6 +23,19 @@ import { ChannelManager } from '../manager.ts'
 import type { Connection } from '../types.ts'
 import { FakeRedis } from './fake_redis.ts'
 
+/**
+ * The connection ids a driver's revocation index currently holds.
+ *
+ * **Every revocation in this file is connection-scoped**, so the record's
+ * `target` is the whole assertion and the channel half is always absent. The
+ * channel scope has its own witnesses (`revocation_encoding_332`,
+ * `mixed_fleet_332`); mapping here would hide a record that arrived carrying a
+ * channel it should not have, so those tests assert the record, not the id.
+ */
+const revokedIds = async (
+    driver: { listRevocations(): Promise<{ target: string }[]> },
+): Promise<string[]> => (await driver.listRevocations()).map((r) => r.target)
+
 const PREFIX = 'app:rt'
 const INDEX = `${PREFIX}__revocations`
 
@@ -43,21 +56,21 @@ Deno.test("#276 race 1: a re-eviction during another instance's reap survives", 
     const a = driverOn(redis)
     const b = driverOn(redis)
     try {
-        await b.markRevoked('x')
-        assertEquals(await a.listRevoked(), ['x'])
+        await b.markRevocation({ target: 'x' })
+        assertEquals(await revokedIds(a), ['x'])
 
         // X's revocation expires…
         redis.setTime(1_400)
-        assertEquals(await a.listRevoked(), [], 'expired, as it should be')
+        assertEquals(await revokedIds(a), [], 'expired, as it should be')
 
         // …and B re-evicts X. Under the old two-structure shape, instance A's
         // in-flight reap could delete the entry B just wrote.
-        await b.markRevoked('x')
+        await b.markRevocation({ target: 'x' })
 
         // A reaps and enumerates. X must survive: its score is now in the
         // future, and the reap is bounded by the same `now` the enumeration is.
         assertEquals(
-            await a.listRevoked(),
+            await revokedIds(a),
             ['x'],
             'the re-eviction survives the concurrent reap',
         )
@@ -74,21 +87,29 @@ Deno.test('#276 race 2: recording a revocation has no window for a reap to step 
     // Count the commands `markRevoked` issues. The old shape issued SADD then
     // SET — two round-trips, and between them the id was enumerable with no
     // marker, so any concurrent reap deleted it. One operation has no between.
+    //
+    // Since #380 the mark first READS the revocation floor, which writes
+    // nothing — so the record itself is still ONE write, and there is still no
+    // window between two writes for a reap to step into.
     const issued: string[] = []
     const counting = (...args: string[]): Promise<unknown> => {
-        issued.push(args[0].toUpperCase())
+        issued.push(
+            `${args[0].toUpperCase()} ${
+                args[0] === 'EVAL' ? args[3] : args[1]
+            }`,
+        )
         return redis.command(...args)
     }
     const a = driverOn(redis, counting)
     try {
-        await a.markRevoked('y')
+        await a.markRevocation({ target: 'y' })
         assertEquals(
-            issued.length,
-            1,
-            `markRevoked must be ONE operation, issued: ${issued.join(', ')}`,
+            issued,
+            ['ZRANGEBYSCORE app:rt__revocation-floor', `EVAL ${INDEX}`],
+            'markRevoked must be ONE write — the floor read, then one EVAL — ' +
+                `issued: ${issued.join(', ')}`,
         )
-        assertEquals(issued[0], 'EVAL')
-        assertEquals(await a.listRevoked(), ['y'])
+        assertEquals(await revokedIds(a), ['y'])
     } finally {
         await a.close()
     }
@@ -103,15 +124,20 @@ Deno.test('#276 FR-011: a re-eviction extends a live revocation, never shortens 
     const shortTtl = new RedisBroadcastDriver(
         { command: redis.command },
         redis.subscriberFor(),
-        { prefix: PREFIX, revocationTtlSeconds: 10 },
+        {
+            prefix: PREFIX,
+            revocationTtlSeconds: 10,
+            // At most half the TTL (#362), or the driver refuses to boot.
+            presence: { reconcileIntervalMs: 5_000 },
+        },
     )
     try {
-        await a.markRevoked('z') // expires at 3300
-        await shortTtl.markRevoked('z') // would expire at 3010 — must not win
+        await a.markRevocation({ target: 'z' }) // expires at 3300
+        await shortTtl.markRevocation({ target: 'z' }) // would expire at 3010 — must not win
 
         redis.setTime(3_100)
         assertEquals(
-            await a.listRevoked(),
+            await revokedIds(a),
             ['z'],
             'the longer revocation stands; ZADD GT refused to shorten it',
         )
@@ -127,16 +153,16 @@ Deno.test('#276 FR-012: two instances with different local clocks agree on what 
     const a = driverOn(redis)
     const b = driverOn(redis)
     try {
-        await a.markRevoked('w')
+        await a.markRevocation({ target: 'w' })
         // Both drivers share one Redis, and `now` is read FROM Redis inside the
         // script — so no instance's wall clock participates in the decision.
         // Whatever Date.now() says on either host, both see the same answer.
-        assertEquals(await a.listRevoked(), ['w'])
-        assertEquals(await b.listRevoked(), ['w'])
+        assertEquals(await revokedIds(a), ['w'])
+        assertEquals(await revokedIds(b), ['w'])
 
         redis.setTime(4_500) // Redis's clock, not an instance's, moves
-        assertEquals(await a.listRevoked(), [])
-        assertEquals(await b.listRevoked(), [])
+        assertEquals(await revokedIds(a), [])
+        assertEquals(await revokedIds(b), [])
     } finally {
         await a.close()
         await b.close()
@@ -148,12 +174,12 @@ Deno.test('#276 FR-003: the reap releases storage, not merely the returned list'
     redis.setTime(5_000)
     const a = driverOn(redis)
     try {
-        await a.markRevoked('p')
-        await a.markRevoked('q')
+        await a.markRevocation({ target: 'p' })
+        await a.markRevocation({ target: 'q' })
         assertEquals(redis.zcard(INDEX), 2)
 
         redis.setTime(5_400)
-        assertEquals(await a.listRevoked(), [])
+        assertEquals(await revokedIds(a), [])
         // The assertion that a filtered return value cannot make: the entries
         // are GONE from storage, so the index stays bounded.
         assertEquals(redis.zcard(INDEX), 0, 'the reap released storage')
@@ -169,19 +195,24 @@ Deno.test('#276 HIGH-1: a shorter-TTL instance cannot shrink the whole index key
     const short = new RedisBroadcastDriver(
         { command: redis.command },
         redis.subscriberFor(),
-        { prefix: PREFIX, revocationTtlSeconds: 5 },
+        {
+            prefix: PREFIX,
+            revocationTtlSeconds: 5,
+            // At most half the TTL (#362), or the driver refuses to boot.
+            presence: { reconcileIntervalMs: 2_500 },
+        },
     )
     try {
-        await long.markRevoked('long-lived') // expires at 8300
+        await long.markRevocation({ target: 'long-lived' }) // expires at 8300
         // A different id, written by an instance with a much shorter TTL. Its
         // own member score is short — that is fine and expected. What must NOT
         // happen is its EXPIRE pulling the whole key's lifetime in with it,
         // because Redis would then delete the key and every live member in it.
-        await short.markRevoked('short-lived')
+        await short.markRevocation({ target: 'short-lived' })
 
         redis.setTime(8_200) // past the short TTL, well inside the long one
         assertEquals(
-            await long.listRevoked(),
+            await revokedIds(long),
             ['long-lived'],
             "the long revocation outlived the short instance's EXPIRE",
         )
@@ -244,7 +275,7 @@ Deno.test('#276 the index key is actually bounded — it does not live forever',
     redis.setTime(10_000)
     const a = driverOn(redis) // ttl 300
     try {
-        await a.markRevoked('bounded')
+        await a.markRevocation({ target: 'bounded' })
         // The key must carry an expiry of its own, so an abandoned deployment
         // that stops enumerating still releases it. `EXPIRE … GT` alone cannot
         // establish one: a key with no TTL counts as an INFINITE TTL, so GT
@@ -270,10 +301,10 @@ Deno.test('#276 FR-004: concurrent reapers are idempotent and lose nothing', asy
     const b = driverOn(redis)
     const c = driverOn(redis)
     try {
-        await a.markRevoked('live-1')
-        await a.markRevoked('live-2')
+        await a.markRevocation({ target: 'live-1' })
+        await a.markRevocation({ target: 'live-2' })
         redis.setTime(11_100)
-        await b.markRevoked('live-3') // a later score than the first two
+        await b.markRevocation({ target: 'live-3' }) // a later score than the first two
 
         // Three instances reap and enumerate at once. Each call reaps
         // `score <= t` and returns `score > t` under one `now`, so overlapping
@@ -281,9 +312,9 @@ Deno.test('#276 FR-004: concurrent reapers are idempotent and lose nothing', asy
         // to return.
         redis.setTime(11_200)
         const [ra, rb, rc] = await Promise.all([
-            a.listRevoked(),
-            b.listRevoked(),
-            c.listRevoked(),
+            revokedIds(a),
+            revokedIds(b),
+            revokedIds(c),
         ])
         assertEquals(ra.sort(), ['live-1', 'live-2', 'live-3'])
         assertEquals(rb.sort(), ['live-1', 'live-2', 'live-3'])
@@ -293,9 +324,9 @@ Deno.test('#276 FR-004: concurrent reapers are idempotent and lose nothing', asy
         // storage released exactly once, not once per reaper.
         redis.setTime(11_500)
         const after = await Promise.all([
-            a.listRevoked(),
-            b.listRevoked(),
-            c.listRevoked(),
+            revokedIds(a),
+            revokedIds(b),
+            revokedIds(c),
         ])
         assertEquals(after, [[], [], []])
         assertEquals(redis.zcard(INDEX), 0)
@@ -306,7 +337,7 @@ Deno.test('#276 FR-004: concurrent reapers are idempotent and lose nothing', asy
     }
 })
 
-Deno.test('#278/SC-001: listRevoked costs ONE command, whatever the count', async () => {
+Deno.test('#278/SC-001 (refined by #359): listRevocations costs one reap plus pages, never one command per member', async () => {
     // The dual read (#276's rollout shim) issued the EVAL, then an SMEMBERS on
     // the legacy index, then one EXISTS PER MEMBER. On a fleet with fifty
     // revoked connections that was fifty-two round trips on every reconcile
@@ -316,6 +347,11 @@ Deno.test('#278/SC-001: listRevoked costs ONE command, whatever the count', asyn
     // #278 deleted it. The point of this test is not that the answer is right
     // (other tests cover that) but that the COST is flat: a reader who adds a
     // second read path later fails here rather than in a latency graph.
+    //
+    // #359 refined "ONE command" to "one reap plus pages, never one per
+    // member": the one-reply read breached the client's reply cap on a large
+    // index. An index that fits one page — every count here — is exactly the
+    // reap `EVAL` and one `ZSCAN`.
     for (const revocations of [0, 1, 50]) {
         const redis = new FakeRedis()
         redis.setTime(1_000)
@@ -332,10 +368,10 @@ Deno.test('#278/SC-001: listRevoked costs ONE command, whatever the count', asyn
         )
         try {
             for (let i = 0; i < revocations; i++) {
-                await driver.markRevoked?.(`conn-${i}`)
+                await driver.markRevocation?.({ target: `conn-${i}` })
             }
             issued.length = 0
-            const live = await driver.listRevoked?.() ?? []
+            const live = await driver.listRevocations?.() ?? []
             assertEquals(
                 live.length,
                 revocations,
@@ -344,8 +380,8 @@ Deno.test('#278/SC-001: listRevoked costs ONE command, whatever the count', asyn
             )
             assertEquals(
                 issued.map((argv) => argv[0]),
-                ['EVAL'],
-                `listRevoked issued ${issued.length} commands for ` +
+                ['EVAL', 'ZSCAN'],
+                `listRevocations issued ${issued.length} commands for ` +
                     `${revocations} revocation(s): ${JSON.stringify(issued)}`,
             )
         } finally {

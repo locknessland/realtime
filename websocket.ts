@@ -13,8 +13,27 @@
 import type { Context, MiddlewareHandler } from '@lockness/hono'
 import { upgradeWebSocket } from '@lockness/hono/deno'
 import type { WSEvents } from '@lockness/hono/network'
-import { renderError } from '@lockness/contract'
 import type { Connection, Socket, WebSocketHooks } from './types.ts'
+import { markedFallbackMarker, writeMarkedFallback } from './marked_fallback.ts'
+
+/**
+ * The marker that starts the DEFAULT websocket error line: an error reached
+ * `reportError` and the application registered no `onError` hook. The error
+ * is rendered after it. Exported for the test suite only — not re-exported
+ * from `mod.ts`.
+ */
+export const UNHANDLED_WEBSOCKET_ERROR = markedFallbackMarker(
+    'realtime: unhandled websocket error:',
+)
+
+/**
+ * The marker that starts the #369 fallback line: the application's `onError`
+ * hook threw or rejected. Both failures are rendered after it. Exported for
+ * the test suite only — not re-exported from `mod.ts`.
+ */
+export const HOOK_FAILED_TOO = markedFallbackMarker(
+    'realtime: unhandled websocket error (the onError hook failed too):',
+)
 
 /** Options for {@link createWebSocketHandler}. */
 export interface WebSocketHandlerOptions<Identity = unknown> {
@@ -133,9 +152,19 @@ export function makeConnection<Identity = unknown>(
 /**
  * Build the Hono `WSEvents` object mapping the socket lifecycle to the hooks.
  *
- * A single {@link Connection} is created lazily on first event and reused. A
- * throw in `onOpen`/`onMessage` is routed to `onError`, never crashing the
- * connection.
+ * A single {@link Connection} is created lazily on first event and reused.
+ *
+ * **Every hook is guarded — `onOpen`, `onMessage` and `onClose` alike.** A
+ * synchronous throw or an async rejection from any of them is routed to
+ * `onError` (or, with none, to one default ERROR line), never crashing the
+ * connection — and never escaping as an unhandled rejection, which Deno
+ * answers by terminating the process and every other socket on it (#369).
+ * The close path is not special: `ChannelManager.handlerHooks().onClose`
+ * awaits `disconnect`, which re-throws a teardown failure by contract.
+ *
+ * **The sink cannot throw past itself either.** An `onError` hook that throws
+ * or rejects falls back to the default ERROR line, which names both the
+ * original error and the hook's own failure.
  *
  * @param hooks - The lifecycle hooks.
  * @param identity - The upgrade-resolved identity.
@@ -162,29 +191,53 @@ export function buildEvents<Identity = unknown>(
         error: unknown,
     ): Promise<void> => {
         if (hooks.onError) {
-            await hooks.onError(conn, error)
-        } else {
-            // No app handler — never swallow silently (security logging).
-            //
-            // Rendered, not handed over as an object. This is the framework's
-            // DEFAULT sink and the hottest of the four in this package:
-            // `guard()` routes every throw from the application's `onOpen` and
-            // `onMessage` here, which is exactly where DSN-bearing driver
-            // failures are produced. The object form printed the message AND
-            // the stack, neither passing through the DSN redaction.
-            //
-            // It also encodes, which matters because a CLIENT reaches this:
-            // `decodeClientMessage` interpolates the frame's own `type` field
-            // into `unknown frame type: ...`. Encoding at THIS sink rather
-            // than at that throw site is deliberate — the thrown message also
-            // goes to the app's `onError` hook, and escaping it there would
-            // corrupt what the application sees in order to fix a problem
-            // that exists only at the log. Measured: rendering here escapes an
-            // injected newline and a U+202E override alike.
-            console.error(
-                `realtime: unhandled websocket error: ${renderError(error)}`,
-            )
+            try {
+                await hooks.onError(conn, error)
+            } catch (failure) {
+                // THE SINK NEVER THROWS PAST ITSELF (#369). It is the last
+                // line: every caller `void`s it, directly or through `guard()`,
+                // so an app `onError` that throws or rejects would reach the
+                // runtime unhandled — and Deno terminates the process on that.
+                // It falls back to a default line instead, carrying the hook's
+                // own failure so that defect is visible too.
+                //
+                // THE MARKER IS IN THE FIXED PREFIX, before any error text.
+                // The error's message can be client-controlled (see below), so
+                // a marker written after it could be forged by a client that
+                // puts the same words in a frame. Both halves are rendered, so
+                // neither can break the line or smuggle control characters.
+                //
+                // The line itself never throws either (#391): a console that
+                // refuses it falls back to stderr, then to nothing.
+                writeMarkedFallback(HOOK_FAILED_TOO, error, {
+                    label: 'hook failure',
+                    error: failure,
+                })
+            }
+            // Handled — by the hook, or by the fallback line above. Never
+            // both lines, and never the default line after a working hook.
+            return
         }
+        // No app handler — never swallow silently (security logging).
+        //
+        // Rendered, not handed over as an object. This is the framework's
+        // DEFAULT sink and the hottest of the four in this package: `guard()`
+        // routes every throw from the application's `onOpen`, `onMessage` and
+        // `onClose` here, which is exactly where DSN-bearing driver failures
+        // are produced. The object form printed the message AND the stack,
+        // neither passing through the DSN redaction.
+        //
+        // It also encodes, which matters because a CLIENT reaches this:
+        // `decodeClientMessage` interpolates the frame's own `type` field into
+        // `unknown frame type: ...`. Encoding at THIS sink rather than at that
+        // throw site is deliberate — the thrown message also goes to the app's
+        // `onError` hook, and escaping it there would corrupt what the
+        // application sees in order to fix a problem that exists only at the
+        // log. Measured: rendering here escapes an injected newline and a
+        // U+202E override alike.
+        //
+        // And it never throws past itself (#391): the caller `void`s it.
+        writeMarkedFallback(UNHANDLED_WEBSOCKET_ERROR, error)
     }
     const guard = async (
         conn: Connection<Identity>,
@@ -207,7 +260,11 @@ export function buildEvents<Identity = unknown>(
         },
         onClose: (evt, ws) => {
             const conn = connFor(ws)
-            void hooks.onClose?.(conn, evt.code, evt.reason)
+            // GUARDED like its siblings (#369). A bare `void` here let one
+            // rejected close — an app `onClose`, or the teardown failure
+            // `disconnect` re-throws under `handlerHooks` — terminate the
+            // whole process.
+            void guard(conn, () => hooks.onClose?.(conn, evt.code, evt.reason))
         },
         onError: (evt, ws) => {
             const conn = connFor(ws)

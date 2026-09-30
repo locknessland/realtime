@@ -18,7 +18,7 @@
  * @module @lockness/realtime/tests/control_refusal
  */
 
-import { assert, assertEquals } from '@std/assert'
+import { assert, assertEquals, assertRejects } from '@std/assert'
 import { RedisBroadcastDriver } from '../drivers/redis.ts'
 import type { ControlRefusal } from '../driver.ts'
 import { FakeRedis } from './fake_redis.ts'
@@ -51,12 +51,21 @@ Deno.test('#318 an OVERSIZE refusal reaches the seam, naming the channel and the
     // carries no bound, and applications are told to put "public info shown to
     // other members" in it — avatars, profile blobs.
     const { driver, seen } = driverWith({ maxPayloadBytes: 256 })
-    await driver.publishControl({
-        kind: 'presence-join',
-        target: 'conn-1',
-        channel: 'presence-ops',
-        member: { id: 'ada', info: { bio: 'x'.repeat(1024) } },
-    })
+    // REJECTS since #326 — it used to refuse and return, which told the caller
+    // the frame was published. The seam still fires either way, and this
+    // asserts both: the operator gets the refusal AND the caller gets the
+    // truth.
+    await assertRejects(
+        () =>
+            driver.publishControl({
+                kind: 'presence-join',
+                target: 'conn-1',
+                channel: 'presence-ops',
+                member: { id: 'ada', info: { bio: 'x'.repeat(1024) } },
+            }),
+        Error,
+        'exceeds control.maxPayloadBytes',
+    )
     await driver.close()
 
     assertEquals(seen.length, 1, 'the refusal must reach the seam')
@@ -132,12 +141,25 @@ Deno.test('#318 a THROWING handler does not become the publisher’s problem', a
     driver.onControlRefused(() => {
         throw new Error('handler is broken')
     })
-    // Must not reject.
-    await driver.publishControl({
-        kind: 'presence-join',
-        target: 'conn-1',
-        channel: 'presence-ops',
-        member: { id: 'ada', info: { bio: 'x'.repeat(1024) } },
-    })
+    // SHARPER since #326. The publish now rejects on oversize, so "must not
+    // reject" is no longer the assertion — the assertion is that it rejects
+    // with the OVERSIZE error and not with the handler's. An observability
+    // callback that replaced the real failure with its own would be worse than
+    // one that merely threw: the caller would be told the wrong thing.
+    const error = await assertRejects(
+        () =>
+            driver.publishControl({
+                kind: 'presence-join',
+                target: 'conn-1',
+                channel: 'presence-ops',
+                member: { id: 'ada', info: { bio: 'x'.repeat(1024) } },
+            }),
+        Error,
+    )
+    assert(
+        error.message.includes('exceeds control.maxPayloadBytes'),
+        `the publisher's own failure must survive a broken handler. ` +
+            `Got: ${error.message}`,
+    )
     await driver.close()
 })

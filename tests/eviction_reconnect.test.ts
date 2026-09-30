@@ -86,11 +86,12 @@ Deno.test('SC-001: an evict missed while the socket was deaf is recovered at rec
     const b = instance(redis)
     try {
         const x = fakeConn('x', { id: 1, name: 'Xavier' })
+        b.manager.register(x)
         await b.manager.subscribe(x, 'presence-lobby')
 
         // An evict is issued elsewhere and durably recorded; B's subscribe
         // socket was between reconnects, so the control frame never landed.
-        await b.driver.markRevoked('x')
+        await b.driver.markRevocation({ target: 'x' })
         assertEquals(closedOf(x), 0, 'X is not revoked yet')
 
         // Well short of reconcileIntervalMs — the periodic timer has NOT fired.
@@ -112,9 +113,8 @@ Deno.test('SC-001: an evict missed while the socket was deaf is recovered at rec
             'the missed evict is recovered AT the reconnect, not on the next tick',
         )
         assertEquals(
-            (await b.driver.listMembers('presence-lobby')).some((m) =>
-                m.id === 1
-            ),
+            (await b.driver.readRoster!('presence-lobby', 1_000, [])).members
+                .some((m) => m.id === 1),
             false,
             'X is dropped from the authoritative roster on recovery',
         )
@@ -133,7 +133,7 @@ Deno.test('SC-001: a presence-free instance also recovers at reconnect', async (
         // starts. The reconnect trigger must not be coupled to it.
         const y = fakeConn('y', { id: 2, name: 'Yves' })
         b.manager.register(y)
-        await b.driver.markRevoked('y')
+        await b.driver.markRevocation({ target: 'y' })
 
         await b.subscriber.fireReconnect()
         await flushMicrotasks()
@@ -169,7 +169,7 @@ Deno.test('FR-007: a reconnect that fires after close() runs nothing, on the inj
     try {
         const z = fakeConn('z', { id: 3, name: 'Zoe' })
         manager.register(z)
-        await driver.markRevoked('z')
+        await driver.markRevocation({ target: 'z' })
 
         // Built through the PUBLIC CONSTRUCTOR with an injected subscriber, so
         // close() neither owns nor closes that subscriber — the subscriber
@@ -231,7 +231,7 @@ Deno.test('FR-003: a re-check that throws at reconnect does not disarm the perio
     try {
         const w = fakeConn('w', { id: 4, name: 'Wren' })
         b.manager.register(w)
-        await b.driver.markRevoked('w')
+        await b.driver.markRevocation({ target: 'w' })
         failNextRead = true
 
         await b.subscriber.fireReconnect()
@@ -279,7 +279,7 @@ Deno.test('FR-004: a seam-less subscriber still completes a full revocation cycl
     try {
         const s = fakeConn('s', { id: 5, name: 'Sam' })
         manager.register(s)
-        await driver.markRevoked('s')
+        await driver.markRevocation({ target: 's' })
 
         await time.tickAsync(1_200)
         await flushMicrotasks()

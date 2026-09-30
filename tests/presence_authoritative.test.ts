@@ -5,7 +5,7 @@
  * Redis (roster store + control bus) join the same presence channel. The roster
  * each client is handed lists every instance's members, and a join announced on
  * one instance reaches presence subscribers on the other. Every assertion reads
- * only `SubscribeResult.members` and the frames a connection received — never an
+ * only `SubscribeResult.here` and the frames a connection received — never an
  * in-process map.
  *
  * @module @lockness/realtime/tests/presence_authoritative
@@ -67,16 +67,18 @@ Deno.test('SC-002: roster is cross-instance authoritative and a join crosses ins
     const b = instance(redis)
     try {
         const x = fakeConn('x', { id: 1, name: 'Xavier' })
+        a.manager.register(x)
         const y = fakeConn('y', { id: 2, name: 'Yolanda' })
+        b.manager.register(y)
 
         // X joins on instance A (first member of the channel).
         const rx = await a.manager.subscribe(x, 'presence-lobby')
-        assertEquals(rx.members?.map((m) => m.id).sort(), [1])
+        assertEquals(rx.here?.members.map((m) => m.id).sort(), [1])
 
         // Y joins on instance B — its roster snapshot lists BOTH X and Y, proving
         // instance B reads instance A's member from the authoritative store.
         const ry = await b.manager.subscribe(y, 'presence-lobby')
-        assertEquals(ry.members?.map((m) => m.id).sort(), [1, 2])
+        assertEquals(ry.here?.members.map((m) => m.id).sort(), [1, 2])
 
         // X (on A) received a `joined` for Y (announced on B) — B → A direction.
         assert(joinedFor(x, 2), 'X should have seen Y join across instances')
@@ -84,8 +86,9 @@ Deno.test('SC-002: roster is cross-instance authoritative and a join crosses ins
         // A third client joins on A; Y (on B) sees it — A → B direction, and A's
         // fresh snapshot lists every instance's members (X, Y, Z).
         const z = fakeConn('z', { id: 3, name: 'Zoe' })
+        a.manager.register(z)
         const rz = await a.manager.subscribe(z, 'presence-lobby')
-        assertEquals(rz.members?.map((m) => m.id).sort(), [1, 2, 3])
+        assertEquals(rz.here?.members.map((m) => m.id).sort(), [1, 2, 3])
         assert(joinedFor(y, 3), 'Y should have seen Z join across instances')
 
         // A member never receives a `joined` for itself.

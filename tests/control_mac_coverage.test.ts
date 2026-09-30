@@ -37,6 +37,7 @@ interface Wire {
     target: string
     channel?: string
     member?: unknown
+    revocationId?: string
     origin: string
     ts: number
     nonce: string
@@ -59,6 +60,7 @@ function canonical(wire: Wire): Uint8Array<ArrayBuffer> {
         origin: wire.origin,
         ts: wire.ts,
         nonce: wire.nonce,
+        revocationId: wire.revocationId,
     }))
 }
 
@@ -106,6 +108,34 @@ Deno.test('FR-013: an evict frame (no channel, no member) is covered too', async
     // differently. A covered-set bug could hide in whichever one is untested.
     const wire = await publishAndCapture({ kind: 'evict', target: 'conn-9' })
     assertEquals(hmacSha256Hex(KEY, canonical(wire)), wire.mac)
+})
+
+Deno.test('#337 a revoke-channel frame is covered, revocationId included', async () => {
+    // The one kind carrying the field. Outside the MAC, anyone with bus access
+    // could re-point a genuine frame at another record id — and the owner
+    // would clear a revocation nobody applied.
+    const wire = await publishAndCapture({
+        kind: 'revoke-channel',
+        target: 'conn-1',
+        channel: 'private-orders',
+        revocationId: '5f0c1c8e-8a4e-4a57-9d8e-2f4b6b1d7c01',
+    })
+    assertEquals(hmacSha256Hex(KEY, canonical(wire)), wire.mac)
+    assert(
+        hmacSha256Hex(
+            KEY,
+            canonical({
+                ...wire,
+                revocationId: '5f0c1c8e-8a4e-4a57-9d8e-2f4b6b1d7c02',
+            }),
+        ) !== wire.mac,
+        "changing 'revocationId' did not change the MAC",
+    )
+    assertEquals(
+        Object.keys(wire).filter((k) => k !== 'mac').sort(),
+        ['channel', 'kind', 'nonce', 'origin', 'revocationId', 'target', 'ts'],
+        'the frame carries exactly the fields this file covers',
+    )
 })
 
 Deno.test('FR-013/SC-006: mutating ANY covered field changes the MAC', async () => {

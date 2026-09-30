@@ -81,17 +81,17 @@ Deno.test('SC-007: an evict lost while the owning socket was disconnected still 
     const b = instance(redis)
     try {
         const x = fakeConn('x', { id: 1, name: 'Xavier' })
+        b.manager.register(x)
         await b.manager.subscribe(x, 'presence-lobby')
         assert(
-            (await b.driver.listMembers('presence-lobby')).some((m) =>
-                m.id === 1
-            ),
+            (await b.driver.readRoster!('presence-lobby', 1_000, [])).members
+                .some((m) => m.id === 1),
             'X should be on the roster before the evict',
         )
 
         // An evict is issued elsewhere and durably recorded, but its control
         // frame never reached B (B's subscribe socket was between reconnects).
-        await b.driver.markRevoked('x')
+        await b.driver.markRevocation({ target: 'x' })
         assertEquals(
             closedOf(x),
             0,
@@ -109,9 +109,8 @@ Deno.test('SC-007: an evict lost while the owning socket was disconnected still 
             'the missed evict is recovered on reconcile',
         )
         assertEquals(
-            (await b.driver.listMembers('presence-lobby')).some((m) =>
-                m.id === 1
-            ),
+            (await b.driver.readRoster!('presence-lobby', 1_000, [])).members
+                .some((m) => m.id === 1),
             false,
             'X is dropped from the authoritative roster on recovery',
         )
@@ -136,7 +135,7 @@ Deno.test('SC-007: a presence-free instance still reconciles a durable revocatio
 
         // An evict is issued and durably recorded elsewhere, but its control
         // frame never reached B (B's subscribe socket was between reconnects).
-        await b.driver.markRevoked('y')
+        await b.driver.markRevocation({ target: 'y' })
         assertEquals(
             closedOf(y),
             0,

@@ -57,6 +57,15 @@ const MUTATIONS: Mutation[] = [
         killedBy: 'EVERY derived name carries the reserved lead-in',
     },
     {
+        label: 'holdersKey un-anchored (#345)',
+        file: DRIVER,
+        edits: [[
+            'return `${this.prefix}${RESERVED_SEPARATOR_LEAD}holders:${channel}',
+            'return `${this.prefix}:holders:${channel}',
+        ]],
+        killedBy: 'EVERY derived name carries the reserved lead-in',
+    },
+    {
         label: 'instancesKey un-anchored',
         file: DRIVER,
         edits: [[

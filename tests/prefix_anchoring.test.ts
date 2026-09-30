@@ -160,9 +160,14 @@ const PREFIX_MEMBERS: readonly string[] = [
     'controlTopic',
     'presenceKey',
     'ownedKey',
+    // The slot's holders hash (#345), driven by `holdMember` / `releaseMember`.
+    'holdersKey',
     'aliveKey',
     'instancesKey',
     'revocationIndexKey',
+    // The revocation floor (#380), driven by the reap, the announce and the
+    // mark's floor read.
+    'revocationFloorKey',
 ]
 
 /**
@@ -210,7 +215,85 @@ const FRAGMENT_DERIVED: readonly string[] = ['topic', 'eventPattern']
 const CANNED = {
     HGETALL: { type: 'array', value: [] },
     ZRANGEBYSCORE: { type: 'array', value: [] },
-    EVAL: { type: 'array', value: [] },
+    // Keyed on the DECLARED KEY COUNT (`EVAL <script> <numkeys> …`) and the
+    // KEY POSITION, never on the script text — a reply chosen by searching
+    // the source breaks on a reformat Lua cannot see. The hold and release
+    // scripts each declare 4 keys and the deregistration script 3 (#345,
+    // #355), and #414 widened each to its OWN reply shape — no longer a
+    // shared bare `0` — so the two 4-key scripts must be told apart. Their
+    // 4th KEY differs by NAME, not by counting: the hold's is the one
+    // fleet-wide instances key, ending `__instances`; the release's is a
+    // per-instance liveness key, which never ends that way. `{arrived,
+    // ownedKind, instancesKind}` for the hold (#414: healthy `set` kinds,
+    // `arrived: false`); `{value, ownedKind}` for the release (#414: `0`,
+    // absent, a healthy `set`); `{code, instancesKind}` for the
+    // deregistration (#414: `0`, deregistered, a healthy `set`) — every
+    // decoder still accepts its own shape. The one 2-key script is the
+    // revocation reap (#359, #380: index, then floor), which answers
+    // `{t, indexKind, floorKind}` (#405, widened #411: a digit bulk, then
+    // each key's prior Redis type — `zset` for both here, healthy keys, so
+    // nothing heals). Of the 1-key scripts: the floor announce (#380) is
+    // picked out by its key ending `__revocation-floor` and answers `kind`
+    // alone since #405 (`zset`, same reasoning); the revocation mark is
+    // picked out by its key ending `__revocations` and answers `{indexKind}`
+    // since #411 (`zset`, same reasoning); every other 1-key script — the
+    // roster read (#341) — gets the roster read's `{ HLEN, sample, selves }`
+    // shape.
+    EVAL: (args: string[]) =>
+        Number(args[2]) === 4
+            ? (args[6].endsWith('__instances')
+                ? {
+                    type: 'array',
+                    value: [
+                        { type: 'integer', value: 0 },
+                        { type: 'bulk', value: 'set' },
+                        { type: 'bulk', value: 'set' },
+                    ],
+                }
+                : {
+                    type: 'array',
+                    value: [
+                        { type: 'integer', value: 0 },
+                        { type: 'bulk', value: 'set' },
+                    ],
+                })
+            : Number(args[2]) === 3
+            ? {
+                type: 'array',
+                value: [
+                    { type: 'integer', value: 0 },
+                    { type: 'bulk', value: 'set' },
+                ],
+            }
+            : Number(args[2]) === 2
+            ? {
+                type: 'array',
+                value: [
+                    { type: 'bulk', value: '1757000000' },
+                    { type: 'bulk', value: 'zset' },
+                    { type: 'bulk', value: 'zset' },
+                ],
+            }
+            : args[3].endsWith('__revocation-floor')
+            ? { type: 'bulk', value: 'zset' }
+            : args[3].endsWith('__revocations')
+            ? {
+                type: 'array',
+                value: [{ type: 'bulk', value: 'zset' }],
+            }
+            : {
+                type: 'array',
+                value: [
+                    { type: 'integer', value: 0 },
+                    { type: 'array', value: [] },
+                    { type: 'array', value: [] },
+                ],
+            },
+    // The revocation pass's page read (#359): an empty index, one page.
+    ZSCAN: {
+        type: 'array',
+        value: [{ type: 'bulk', value: '0' }, { type: 'array', value: [] }],
+    },
     TIME: {
         type: 'array',
         value: [
@@ -218,13 +301,16 @@ const CANNED = {
             { type: 'bulk', value: '0' },
         ],
     },
+    // The heartbeat's `SET … GET` (#349) decodes a nil or a bulk and refuses
+    // the default `null`, which would turn every beat into a WARN.
+    SET: { type: 'nil' },
 }
 
 /**
  * Drive every prefix-deriving path in the driver and return what crossed the
  * ports.
  *
- * No timer and no `FakeTime`: `addMember` awaits `#ensureSweepStarted()`, which
+ * No timer and no `FakeTime`: `holdMember` awaits `#ensureSweepStarted()`, which
  * awaits `#heartbeat()` before installing either interval
  * (`drivers/redis.ts:733`, `:1116`), so the instance and liveness keys are
  * created synchronously on the first join.
@@ -247,13 +333,13 @@ async function exercise(prefix: string) {
         driver.onRevocationReconcile(() => {})
         await driver.publish({ channel: 'room', event: 'e', data: {} })
         await driver.publishControl({ kind: 'evict', target: 'conn-1' })
-        // addMember reaches instancesKey and aliveKey too: it awaits
+        // holdMember reaches instancesKey and aliveKey too: it awaits
         // #ensureSweepStarted() -> #heartbeat() before any interval exists.
-        await driver.addMember('presence-room', { id: 'u1', info: {} })
-        await driver.listMembers('presence-room')
-        await driver.removeMember('presence-room', 'u1')
-        await driver.markRevoked('conn-1')
-        await driver.listRevoked()
+        await driver.holdMember('presence-room', { id: 'u1', info: {} })
+        await driver.readRoster('presence-room', 1_000, [])
+        await driver.releaseMember('presence-room', 'u1')
+        await driver.markRevocation({ target: 'conn-1' })
+        await driver.listRevocations()
     } finally {
         await driver.close()
     }
@@ -336,7 +422,7 @@ Deno.test('SC-001: every prefix-derived name is anchored', async () => {
     // The exact SET, not `> 0` and not a count.
     //
     // `> 0` let two names vanish. A pinned COUNT then let them vanish in pairs:
-    // dropping `topic` from the exercise while a second `listMembers` call adds
+    // dropping `topic` from the exercise while a second `readRoster` call adds
     // one more `presenceKey` shape keeps the total at ten, and the assertion
     // stays green with `topic` asserted by nothing. Verified — that mutation was
     // GREEN against the count and is RED against this set.
@@ -364,9 +450,11 @@ Deno.test('SC-001: every prefix-derived name is anchored', async () => {
             // matches against, and the channel half is the part a nested prefix
             // could once reach into.
             'alpha__event:room',
+            'alpha__holders:presence-room u1',
             'alpha__instances',
             'alpha__owned:<id>',
             'alpha__presence:presence-room',
+            'alpha__revocation-floor',
             'alpha__revocations',
         ],
         'the differential captured a different set of derived names than the ' +
@@ -427,9 +515,11 @@ Deno.test('FR-006: every pinned member is actually driven by the exercise', asyn
         controlTopic: 'alpha__control',
         presenceKey: 'alpha__presence:presence-room',
         ownedKey: 'alpha__owned:',
+        holdersKey: 'alpha__holders:presence-room u1',
         aliveKey: 'alpha__alive:',
         instancesKey: 'alpha__instances',
         revocationIndexKey: 'alpha__revocations',
+        revocationFloorKey: 'alpha__revocation-floor',
     }
     // `eventPattern` is checked SEPARATELY, and the reason is the point of
     // splitting it from `topic` at all: the two produce the same bytes today,
@@ -987,11 +1077,33 @@ Deno.test('FR-004: the refused sequence and the separator lead-in are ONE decisi
 async function presenceKeyOf(prefix: string, channel: string): Promise<string> {
     const { command, subscriber, recording } = recordingPorts(CANNED)
     const driver = new RedisBroadcastDriver(command, subscriber, { prefix })
-    await driver.addMember(channel, { id: 'u1', info: {} })
+    await driver.holdMember(channel, { id: 'u1', info: {} })
     await driver.close()
-    const hset = recording.commands.find((argv) => argv[0] === 'HSET')
-    assert(hset !== undefined, 'addMember did not HSET')
-    return hset[1]
+    // Read the key off the EVAL, not off an HSET. `holdMember` became ONE
+    // operation in #323 — the presence-hash write and the owned-set write are
+    // two structures encoding one fact, and two round-trips could write them
+    // into disagreement. `EVAL <script> <numkeys> KEYS…` puts the presence key
+    // first, so argv[3] is what this helper has always been asking for: the key
+    // the driver DERIVES. Matching on the command name was matching the shape.
+    const evaluated = recording.commands.find((argv) => argv[0] === 'EVAL')
+    assert(evaluated !== undefined, 'holdMember did not EVAL its roster write')
+    // FOUR keys since #345: presence hash, holders hash, owned set, instances
+    // set — the presence key still first.
+    assert(
+        evaluated[2] === '4',
+        `the hold script must declare 4 keys, got ${evaluated[2]}`,
+    )
+    const key = evaluated[3]
+    // WHICH key, not just the first one. Swap KEYS[1] and KEYS[2] in the driver
+    // and this helper would return the OWNED key, which embeds a per-instance
+    // UUID — so every collision assertion below would compare strings that can
+    // never collide, and the whole file would pass while guarding nothing. The
+    // presence key is the one that carries the channel.
+    assert(
+        key.includes(channel),
+        `KEYS[1] must be the presence key for ${channel}, got ${key}`,
+    )
+    return key
 }
 
 Deno.test('FR-012: two accepted prefixes cannot derive the same KEY', async () => {
@@ -1004,7 +1116,7 @@ Deno.test('FR-012: two accepted prefixes cannot derive the same KEY', async () =
     //   prefix "app:presence:eu" + channel "room"
     //     -> both "app:presence:eu:presence:room"
     //
-    // One deployment's `listMembers` returned the other's roster, with
+    // One deployment's `readRoster` returned the other's roster, with
     // `member.info`. Both prefixes are accepted and the channel is a valid
     // name, so it was reachable by configuration alone.
     //

@@ -21,7 +21,7 @@
  */
 
 import { assert, assertEquals, assertThrows } from '@std/assert'
-import { ChannelManager } from '../manager.ts'
+import { ChannelManager, ConnectionIdError } from '../manager.ts'
 import { isValidName } from '../protocol.ts'
 import type { BroadcastDriver } from '../driver.ts'
 import type { Connection } from '../types.ts'
@@ -76,16 +76,21 @@ Deno.test('#304 registering a connection with an out-of-charset id throws', () =
 })
 
 Deno.test('#304 subscribing with an out-of-charset id throws too', async () => {
-    // The second registration site. `subscribe` writes the connection into the
-    // same map, so guarding only `register` would leave a way in.
+    // The second boundary. Since #370 `subscribe` no longer binds anything —
+    // `register` is the only way in — but it still names the id defect FIRST,
+    // ahead of the admission refusals, so a transport that skipped `register`
+    // with an unusable id is told what is actually wrong with it.
     const m = new ChannelManager<User>({ authorize: () => true })
-    let threw = false
+    let threw: unknown
     try {
         await m.subscribe(conn('user@example.com'), 'presence-room')
-    } catch {
-        threw = true
+    } catch (error) {
+        threw = error
     }
-    assertEquals(threw, true, 'subscribe accepted an out-of-charset id')
+    assert(
+        threw instanceof ConnectionIdError,
+        `subscribe names the id defect first. Got: ${threw}`,
+    )
     assertEquals(m.connectionCount, 0, 'the connection was tracked anyway')
 })
 
@@ -97,8 +102,11 @@ Deno.test('#304 an ordinary id is accepted by both sites', async () => {
     assertEquals(m.connectionCount, 1)
 
     const other = conn('svc:worker-3.a_b-1')
+    m.register(other)
+    assertEquals(m.connectionCount, 2, 'the register site accepted it')
     const result = await m.subscribe(other, 'presence-room')
-    assertEquals(result.ok, true)
+    assertEquals(result.ok, true, 'and so did the subscribe site')
+    // Only `register` binds (#370): the subscribe moved no count.
     assertEquals(m.connectionCount, 2)
 })
 
@@ -155,7 +163,7 @@ Deno.test('#304 evict() refuses an out-of-charset id rather than no-opping', asy
 })
 
 Deno.test('#304 reconcile drops a broker-injected id outside the charset', async () => {
-    // The second, independent control. `listRevoked` is broker-sourced — a
+    // The second, independent control. `listRevocations` is broker-sourced — a
     // writer with bus access can put anything in the index — and reconcile
     // hands what it finds straight to `revokeLocal`. The control-plane path has
     // always filtered `wire.target`; this one did not, and that asymmetry was
@@ -169,27 +177,46 @@ Deno.test('#304 reconcile drops a broker-injected id outside the charset', async
     const { recordingPorts } = await import('./recording_ports.ts')
 
     // RESP shapes, not bare arrays: `asArray` requires `{ type: 'array' }` and
-    // `asInteger` requires `{ type: 'integer' }`. A bare array coerces to
-    // undefined, the driver logs "unexpected reply shape" and returns nothing —
-    // which would have made this test pass for an empty result had it asserted
-    // only that the bad ids were absent. It asserts the whole set instead.
+    // `asBulk` requires `{ type: 'bulk' }`. A bare array is a malformed page,
+    // and the pass throws on it (#359) — asserting the whole set below is what
+    // keeps an empty or failed result from passing this test.
+    //
+    // Since #359 the read is a reap (`EVAL`, answering the Redis second `t`)
+    // then `ZSCAN` pages of `member, score` pairs: every score here is above
+    // `t`, so the charset filter alone decides what survives.
     const bulk = (value: string) => ({ type: 'bulk', value })
     const array = (value: unknown[]) => ({ type: 'array', value })
+    const members = [
+        '7c9e6679-7425-40de-944b-e07fc1f90ae7',
+        'user@example.com',
+        // FOUR space-separated names. Exactly three valid names is a
+        // well-formed channel-scoped record since #337 (`target channel
+        // id`), so a three-word id would test the scope decoder instead.
+        'an id with spaces',
+        'svc:worker-3',
+        'x\nGET /admin 200',
+    ]
     const { command, subscriber, recording } = recordingPorts({
-        // The new sorted set, via EVAL.
-        EVAL: array([
-            bulk('7c9e6679-7425-40de-944b-e07fc1f90ae7'),
-            bulk('user@example.com'),
-            bulk('id with spaces'),
-            bulk('svc:worker-3'),
-            bulk('x\nGET /admin 200'),
+        // The reap's `{t, indexKind, floorKind}` (#405, widened #411): both
+        // keys a healthy `zset`, so nothing heals.
+        EVAL: array([bulk('1000'), bulk('zset'), bulk('zset')]),
+        // One page, cursor `0`: every record scored past `t`.
+        ZSCAN: array([
+            bulk('0'),
+            array(members.flatMap((m) => [bulk(m), bulk('1300')])),
         ]),
     })
 
     const driver = new RedisBroadcastDriver(command, subscriber, {
         prefix: 'app',
     })
-    const revoked = await driver.listRevoked?.() ?? []
+    // Mapped to ids because THIS test is about the charset filter, not about
+    // scope: every record it plants is connection-scoped, and a record that
+    // came back carrying a channel would be a different failure with its own
+    // witness (`revocation_encoding_332`).
+    const revoked = (await driver.listRevocations?.() ?? []).map((r) =>
+        r.target
+    )
 
     assertEquals(
         revoked.sort(),
@@ -199,10 +226,10 @@ Deno.test('#304 reconcile drops a broker-injected id outside the charset', async
         ],
         'the filter kept or dropped the wrong ids',
     )
-    // Positive control: the EVAL leg ran at all, so an empty result would not
-    // pass this test for the wrong reason.
+    // Positive control: the index was read at all, so an empty result would
+    // not pass this test for the wrong reason.
     assertEquals(
-        recording.commands.some((argv) => argv[0] === 'EVAL'),
+        recording.commands.some((argv) => argv[0] === 'ZSCAN'),
         true,
         'the revocation index was never read',
     )
@@ -222,17 +249,18 @@ Deno.test('#304 subscribe rejects before the authorizer runs', async () => {
         },
     })
 
-    let threw = false
+    // Never registered, on purpose: `register` would refuse the id first, and
+    // this row is about `subscribe`'s own boundary (#370 left it first).
+    let threw: unknown
     try {
         await m.subscribe(conn('user@example.com'), 'private-billing')
-    } catch {
-        threw = true
+    } catch (error) {
+        threw = error
     }
 
-    assertEquals(
-        threw,
-        true,
-        'a denied private channel swallowed the id defect',
+    assert(
+        threw instanceof ConnectionIdError,
+        `a denied private channel swallowed the id defect. Got: ${threw}`,
     )
     assertEquals(authorizerRan, false, 'the authorizer ran on an unusable id')
 })
